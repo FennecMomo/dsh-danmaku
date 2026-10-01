@@ -155,10 +155,22 @@ node tools/check.mjs
 假 ctx 复刻了 Cordis 的 inject 门禁（第 1 条坑），所以"忘了声明 timer"这类问题在自检里就会现形，
 不必等到真机。
 
-`tools/verify-live.mjs` 管的是另一半：对着**正在跑的那台机器**问四个问题 —— host 是不是新代码、
-SSE 长连接稳不稳、DSH 的 index 里有没有前端 loader、overlay 白名单里有没有。改完 host 代码
-重启之后拿它复核；它需要 `/dsh-danmaku/v3/status` 和 `/dsh-overlay`，index 那一项要凭据
-（从旁边 overlay 仓库的 `.launch-url.txt` 读 fresh token，读不到就跳过那一项而不算失败）。
+`tools/verify-live.mjs` 管的是另一半：对着**正在跑的那台机器**问六个问题 —— host 是不是新代码、
+SSE handler 有没有抛过错、跟着哪个活跃会话、SSE 长连接稳不稳、DSH 的 index 里有没有前端 loader、
+overlay 白名单里有没有。改完 host 代码重启之后拿它复核；它需要 `/dsh-danmaku/v3/status` 和
+`/dsh-overlay`，index 那一项要凭据（从旁边 overlay 仓库的 `.launch-url.txt` 读 fresh token，
+读不到就跳过那一项而不算失败）。
+
+`tools/verify-page.mjs` 管最后一段：**页面里到底长出来没有**。它起一个**独立的**无头 Edge
+（独立 user-data-dir，不碰主人在用的浏览器），走带 token 的 login URL 建立会话，打开真实页面，
+检查浮层有没有被自动注入、气泡、点开的详情、以及事件流有没有在喊断线，最后截一张图；
+`--url /dsh-overlay` 就换 overlay 那个宿主。
+
+这里有一处值得记住的教训：**判断 SSE 不能只读一次前端那行提示**。它在 open 与 error 之间会
+**闪** —— EventSource 一重连成功就清空、一失败又写回去 —— 只读一次有一半概率读到"干净"的那一瞬，
+把断线的连接误判成健康的。这个脚本的第一版就这么被骗过一次；现在它连采 8 次，并且同时数
+`performance` 里 `/stream` 的请求条数（Resource Timing 只记录**已结束**的请求，所以一条健康的
+长连接反而**不**留下记录，一串记录才说明它在反复断）。
 
 ---
 

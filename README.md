@@ -70,31 +70,30 @@ dsh plugin --profile web add link:D:\Projects\dsh-plugins\dsh-danmaku\plugin
 ## 自检
 
 ```powershell
-node tools/check.mjs        # 离线：假 root + 假 ctx 跑 host，最小 DOM 跑前端（23 项）
-node tools/verify-live.mjs  # 现场：问正在跑的那台机器四个问题
+node tools/check.mjs                            # 离线：假 root + 假 ctx 跑 host，最小 DOM 跑前端（23 项）
+node tools/verify-live.mjs                      # 现场：问正在跑的那台机器六个问题
+node tools/verify-page.mjs                      # 页面：独立无头 Edge 打开真实 DSH 页面（自动注入那份）
+node tools/verify-page.mjs --url /dsh-overlay   # 页面：换 overlay 那个宿主
 ```
 
-离线那份不需要装进 profile、不需要浏览器，`plugin/README.md` 里列了它覆盖的 23 项，
-以及它的假 ctx 为什么要复刻 Cordis 的 inject 门禁。
+三个脚本各管一段，合起来覆盖"代码对不对 → 这台机器上接口对不对 → 页面里到底长出来没有"：
 
-现场那份是给"改完 host 代码、重启之后"用的复核：
+| 脚本 | 它问什么 | 为什么需要它 |
+| --- | --- | --- |
+| `check.mjs` | 两半的代码对不对 | 假 root 里复刻了 Cordis 的 inject 门禁，host 那半边**不必重启**就能验 |
+| `verify-live.mjs` | host 是不是新代码 / SSE 稳不稳 / 两处注入在不在 | 这几件事没有本地观测点，只有真机能答 |
+| `verify-page.mjs` | 页面里浮层有没有自动出现、气泡、详情、事件流 | 起独立无头 Edge（不碰主人在用的浏览器），顺带截一张图 |
 
-| 它问什么 | 为什么会问 |
-| --- | --- |
-| host 半边是不是**新代码**（`build` 字段） | 改了 host 代码不重启的话，跑的还是旧模块，而旧模块看起来一切都正常 |
-| SSE 长连接稳不稳（5 秒不被掐断） | 这条没有别的观测点：浏览器里只会看到"前端无限重连" |
-| DSH 的 index 里有没有前端 loader | web 形态的注入 |
-| overlay 页面里有没有同一份脚本 | 跨插件那条（`WHITELIST`） |
-
-它现在就**故意是红的**：三处不通过，全都指向"还没重启客户端"。重启后应当全绿 ——
-红着的时候它说的每一句都指明了该动什么。
+`verify-live` 的六项分别是：host 是新代码、SSE handler 没抛过错、跟着一个活跃会话、SSE 长连接稳得住、
+DSH 的 index 里有前端 loader、overlay 页面里有同一份脚本。重启客户端之前它会红三处，
+而每一句红字都指明了该动什么。
 
 ## 目录
 
 | 路径 | 放什么 |
 | --- | --- |
 | `plugin/` | DSH 插件包（host 半边 + 前端本体 + 挂载声明） |
-| `tools/` | 离线自检 |
+| `tools/` | 三个自检脚本：离线（`check`）/ 现场接口（`verify-live`）/ 页面端到端（`verify-page`） |
 
 ## 状态
 
@@ -110,15 +109,12 @@ node tools/verify-live.mjs  # 现场：问正在跑的那台机器四个问题
 | web 形态**端到端**（自动注入 → 前端启动 → 回填） | ✅ 独立无头 Edge 打开真实 DSH 页面，什么都不做：浮层自己出现、回填 3 条气泡、零 JS 错误 |
 | 注入行进了 web 形态的 index | ✅ curl DSH 的 index，里面就有那行内联 loader（排在 `__DSH_BOOT_READY__` 之前） |
 | `timer` 进 inject 这条修复 | ✅ 用临时探针插件在真机上验证：`ctx.interval` 可用、带心跳的 SSE 稳定跑了 8 秒收到 5 次 ping；`ctx.get('agents')`（会话过滤）与 `ctx.get('sessionController')`（发送）都在 |
+| **重启后**：两处的自动注入 | ✅ `verify-page.mjs` 在 DSH 页面与 overlay 页面各跑一遍：浮层自己出现、气泡、详情 + `Esc`、零 JS 错误 |
+| **重启后**：overlay 白名单生效 | ✅ `verify-page.mjs --url /dsh-overlay` 通过，且 status 里 `lastStreamError` 为空 |
+| **重启后**：端到端实时（SSE） | ✅ 长连接稳定保持 24 秒并收到 20 秒那一次心跳；`clients` 稳定在个位数（不再累积死连接） |
+| **重启后**：跟随最近活跃会话 | ✅ 真机上自然发生：`active` 从本会话切到另一个有明显活动的会话，浮层里的气泡整体换掉 |
 
-还没验证的（要等一次客户端重启，重启后 host 新代码与新的白名单才会加载）：
-
-- ⏳ DSH **桌面端**页面里的自动注入 —— web 形态已经用 curl index 验证过；桌面端的注入表是宿主
-  **启动时收集一次**的，所以只有重启才算数。
-- ⏳ overlay 页面里 `WHITELIST` 生效。
-- ⏳ 端到端的**实时**：重启后说一句话，气泡应当立刻冒出来（重启前跑的是旧模块，
-  `ctx.interval` 还在抛错，所以 SSE 只能靠 `recent` 回填 —— 屏幕上看起来"有气泡"，但新的不来）。
-  复核方式：`/dsh-danmaku/v3/status` 里的 `clients` 不该一直涨、`lastStreamError` 应当是空的。
+也就是说，**从代码到真机、从 DSH 页面到桌面 overlay，全部验证完成**。
 
 另外记一笔：**换 `package.json` 的 `main` 指向新文件，并不能让 host 代码热重载** ——
 试过了，loader 缓存的是包级模块，重启是唯一可靠的路（见 [`plugin/README.md`](plugin/README.md#六个坑都是实测的不是推测)）。
