@@ -105,6 +105,22 @@
     '.dshd-detail pre{margin:0;padding:10px;max-height:46vh;overflow:auto;color:#DCE3EA;font-size:12px;line-height:1.6;',
     'white-space:pre-wrap;word-break:break-word;font-family:"Cascadia Mono",Consolas,"Microsoft YaHei UI",monospace}',
     '.dshd-note{pointer-events:none;color:#8B98A5;font-size:11px;min-height:14px;text-align:right}',
+    /*
+     * 会话菜单：绝对定位贴着工具行**往上**弹。
+     * 浮层永远待在屏幕下半部分，往下弹会直接出屏。
+     */
+    '.dshd-menu{pointer-events:auto;position:absolute;right:0;bottom:52px;display:none;flex-direction:column;',
+    'min-width:210px;max-width:330px;max-height:52vh;overflow:auto;box-sizing:border-box;padding:4px;',
+    'background:#0E1218;border:1px solid #3A4552;border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.45)}',
+    '.dshd-menu.dshd-open{display:flex}',
+    '.dshd-menu-head{padding:5px 8px 6px;margin-bottom:4px;border-bottom:1px solid #232B36;color:#5C6672;font-size:11px}',
+    '.dshd-item{display:flex;flex-direction:column;gap:1px;width:100%;box-sizing:border-box;text-align:left;',
+    'background:transparent;border:none;border-radius:6px;padding:6px 8px;color:#DCE3EA;font:inherit;font-size:12px;cursor:pointer}',
+    '.dshd-item:hover{background:#1A2230}',
+    '.dshd-item.dshd-current{background:#1B2B47}',
+    '.dshd-item-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.dshd-item-sub{color:#8B98A5;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.dshd-empty{padding:8px;color:#6B7684;font-size:11px}',
   ].join('')
 
   /* -- 小工具 ---------------------------------------------------------------- */
@@ -147,8 +163,14 @@
   var input = null
   var sendButton = null
   var note = null
+  var menu = null
+  var menuButton = null
   /** 现在跟着哪个会话——由 host 的 recent / 事件流给，前端不猜。 */
   var activeSession = ''
+  /** host 那边钉住的会话；空串 = 自动跟随。这个也只有 host 说了算。 */
+  var focusedSession = ''
+  /** 最近一次拉到的会话列表。打开菜单先用它画一版，再去拉最新的。 */
+  var sessionRows = []
 
   function installStyle() {
     if (document.getElementById(STYLE_ID) !== null) return
@@ -190,13 +212,19 @@
     var bar = element('div', 'dshd-bar')
     var grip = element('div', 'dshd-grip', IS_OVERLAY ? '' : '⣿')
     grip.title = IS_OVERLAY ? '桌面 overlay 里的位置固定在工作区右下角' : '按住拖动，位置会记住'
+    menuButton = element('button', 'dshd-btn', '☰')
+    menuButton.title = '选择要看哪个会话的弹幕'
     var eye = element('button', 'dshd-btn', '◐')
     eye.title = '淡出 / 恢复弹幕'
     var pen = element('button', 'dshd-btn', '✎')
     pen.title = '给当前会话发一句话'
     bar.appendChild(grip)
+    bar.appendChild(menuButton)
     bar.appendChild(eye)
     bar.appendChild(pen)
+
+    /* 菜单挂在 root 上、靠绝对定位浮在工具行上方：它是覆盖层，不该参与 flex 布局把气泡顶上去。 */
+    menu = element('div', 'dshd-menu')
 
     note = element('div', 'dshd-note')
 
@@ -205,6 +233,7 @@
     root.appendChild(composer)
     root.appendChild(bar)
     root.appendChild(note)
+    root.appendChild(menu)
     document.body.appendChild(root)
 
     /* 位置：DSH 页面里恢复上次拖到的地方；overlay 里固定右下角（那里拖动会断，见文件头）。 */
@@ -220,6 +249,8 @@
     } else {
       grip.style.cursor = 'default'
     }
+
+    menuButton.addEventListener('click', toggleMenu)
 
     eye.addEventListener('click', function () {
       root.classList.toggle('dshd-hidden')
@@ -271,7 +302,24 @@
     })
     /* Esc 关详情：页面里可能是 DSH 自己的快捷键，所以只在面板开着的时候拦。 */
     document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && detailBox.classList.contains('dshd-open')) closeDetail()
+      if (event.key !== 'Escape') return
+      if (detailBox.classList.contains('dshd-open')) closeDetail()
+      closeMenu()
+    })
+
+    /*
+     * 点别处收起菜单。
+     *
+     * 用 mousedown 而不是 click：click 要等菜单项自己的处理器跑完才冒到这里，那时菜单已经被
+     * `chooseSession` 关掉了——行为上看着一样，但"点空白"和"点菜单项"会走两条不同的路径，
+     * 早晚有一条会出错。
+     */
+    document.addEventListener('mousedown', function (event) {
+      if (menu === null || !menu.classList.contains('dshd-open')) return
+      var target = event.target
+      if (target === menuButton || (menuButton !== null && menuButton.contains(target))) return
+      if (menu.contains(target)) return
+      closeMenu()
     })
   }
 
@@ -405,6 +453,129 @@
       })
   }
 
+  /* -- 会话菜单 -------------------------------------------------------------- */
+
+  function relativeTime(at) {
+    if (typeof at !== 'number' || at <= 0) return ''
+    var seconds = Math.max(0, Math.round((Date.now() - at) / 1000))
+    if (seconds < 60) return '刚刚'
+    var minutes = Math.round(seconds / 60)
+    if (minutes < 60) return minutes + ' 分钟前'
+    var hours = Math.round(minutes / 60)
+    if (hours < 24) return hours + ' 小时前'
+    return Math.round(hours / 24) + ' 天前'
+  }
+
+  function updateMenuButton() {
+    if (menuButton === null) return
+    menuButton.classList.toggle('dshd-on', focusedSession !== '')
+    menuButton.title =
+      focusedSession === '' ? '选择要看哪个会话的弹幕（现在：自动跟随）' : '正钉在一个会话上，点这里换'
+  }
+
+  function renderMenu() {
+    if (menu === null) return
+    menu.textContent = ''
+    menu.appendChild(element('div', 'dshd-menu-head', '弹幕跟着哪个会话'))
+
+    var auto = element('button', 'dshd-item' + (focusedSession === '' ? ' dshd-current' : ''))
+    auto.appendChild(element('div', 'dshd-item-title', '自动跟随'))
+    auto.appendChild(element('div', 'dshd-item-sub', '谁在说话就看谁'))
+    auto.addEventListener('click', function () {
+      chooseSession('')
+    })
+    menu.appendChild(auto)
+
+    if (sessionRows.length === 0) {
+      menu.appendChild(element('div', 'dshd-empty', '还没有别的会话在说话'))
+      return
+    }
+
+    sessionRows.forEach(function (row) {
+      var current = focusedSession === row.id
+      var item = element('button', 'dshd-item' + (current ? ' dshd-current' : ''))
+      /* 有标题就用标题，没有就退回 id 前几位——菜单里最不该出现的是一排"什么都没写"。 */
+      item.appendChild(element('div', 'dshd-item-title', row.title || row.id.slice(0, 8) + '…'))
+      var parts = []
+      if (row.lastAt) parts.push(relativeTime(row.lastAt))
+      if (row.lastText) parts.push(row.lastText)
+      item.appendChild(element('div', 'dshd-item-sub', parts.join(' · ') || '（还没有动静）'))
+      /* 完整 id 挂在 title 上：短 id 是用来认人的，要复制/核对时还得看全的。 */
+      item.title = row.id
+      item.addEventListener('click', function () {
+        chooseSession(row.id)
+      })
+      menu.appendChild(item)
+    })
+  }
+
+  function refreshSessions() {
+    window
+      .fetch(API + '/sessions', { headers: { accept: 'application/json' } })
+      .then(function (response) {
+        return response.json()
+      })
+      .then(function (data) {
+        if (data === null || data === undefined) return
+        if (typeof data.focused === 'string') focusedSession = data.focused
+        if (typeof data.active === 'string' && data.active !== '') activeSession = data.active
+        sessionRows = Array.isArray(data.sessions) ? data.sessions : []
+        updateMenuButton()
+        renderMenu()
+      })
+      .catch(function () {
+        setNote('拿不到会话列表')
+      })
+  }
+
+  function closeMenu() {
+    if (menu !== null) menu.classList.remove('dshd-open')
+  }
+
+  function toggleMenu() {
+    if (menu === null) return
+    if (menu.classList.contains('dshd-open')) {
+      closeMenu()
+      return
+    }
+    /* 先用手上的列表画一版（点开就有东西），再去拉最新的把内容换掉。 */
+    renderMenu()
+    menu.classList.add('dshd-open')
+    refreshSessions()
+  }
+
+  function chooseSession(sessionId) {
+    closeMenu()
+    window
+      .fetch(API + '/focus', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: sessionId }),
+      })
+      .then(function (response) {
+        return response.json()
+      })
+      .then(function (result) {
+        if (result === null || result === undefined || result.ok !== true) {
+          setNote(String((result && result.error) || '切换失败').slice(0, 60))
+          return
+        }
+        focusedSession = typeof result.focused === 'string' ? result.focused : ''
+        updateMenuButton()
+        /*
+         * host 已经推了一条 session:switch 给所有前端（包括我们自己），气泡会在那条消息里被清空。
+         * 这里再补一次回填：事件流只从"现在"开始，不回填的话切过去是一片空白——
+         * 而那恰恰是刚点了菜单的人最想看的东西。
+         */
+        clearBubbles()
+        closeDetail()
+        backfill()
+      })
+      .catch(function (error) {
+        setNote(String((error && error.message) || error).slice(0, 60))
+      })
+  }
+
   /* -- 数据 ------------------------------------------------------------------ */
 
   function handle(event) {
@@ -430,6 +601,11 @@
       .then(function (data) {
         if (data === null || data === undefined) return
         if (typeof data.active === 'string' && data.active !== '') activeSession = data.active
+        /* 回填顺带把"现在钉着谁"同步过来：刷新之后按钮的状态不该靠猜。 */
+        if (typeof data.focused === 'string') {
+          focusedSession = data.focused
+          updateMenuButton()
+        }
         var events = Array.isArray(data.events) ? data.events.slice(-BACKFILL) : []
         for (var index = 0; index < events.length; index += 1) addBubble(events[index])
         if (input !== null && activeSession !== '') input.placeholder = '发往 ' + activeSession.slice(0, 8) + '…'

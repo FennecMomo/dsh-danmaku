@@ -16,10 +16,12 @@
  *     GET  /dsh-danmaku/v3/bubbles.js   前端本体（按 mtime 热读，改完刷新页面即生效）
  *     GET  /dsh-danmaku/v3/stream       SSE，实时事件
  *     GET  /dsh-danmaku/v3/recent       JSON 回填（含「现在是哪个会话」）
+ *     GET  /dsh-danmaku/v3/sessions     会话列表（浮层上那个会话选择菜单的数据源）
+ *     POST /dsh-danmaku/v3/focus        钉住某个会话看；空串 = 恢复自动跟随
  *     POST /dsh-danmaku/v3/send         把一句话发进会话（前端那条折叠输入框用）
- *     GET  /dsh-danmaku/v3/status       诊断：活跃会话、客户端数、前端文件状态
+ *     GET  /dsh-danmaku/v3/status       诊断：活跃会话、会话表、客户端数、前端文件状态
  *
- * 每条路由都走 `ctx.effect`，所以插件停用/更新时五条一起撤掉。留下一条还在应答的路由，
+ * 每条路由都走 `ctx.effect`，所以插件停用/更新时七条一起撤掉。留下一条还在应答的路由，
  * 就是一个插件"该走了却还在说话"的样子。
  */
 import { readFileSync, statSync } from 'node:fs'
@@ -33,9 +35,13 @@ const FRONT_FILE = join(HERE, 'bubbles.js')
 const MOUNT = '/dsh-danmaku/v3'
 const FRONT_URL = `${MOUNT}/bubbles.js`
 
-/** 回填窗口。这是一份"补课"，不是历史：面板/浮层迟到时够看就行。 */
+/** 自动模式下回填多少条（所有会话混起来按时间排）。这是一份"补课"，不是历史。 */
 const RECENT_LIMIT = 120
-/** 「上一轮说了什么」最多记住几个会话，免得 Map 跟着会话数无限长。 */
+/** 每个会话各留多少条：钉住一个安静会话时，它那几条不该被别人的刷掉。 */
+const RECENT_PER_SESSION = 30
+/** 会话表最多记多少个，免得两个 Map 跟着进程寿命无限长。 */
+const SESSION_MEMORY = 64
+/** 「上一轮说了什么」最多记住几个会话。 */
 const ANSWER_MEMORY = 32
 
 // --------------------------------------------------------------------------- //
@@ -396,7 +402,19 @@ export default {
      */
     root.inject(['webServer', 'timer'], (ctx) => {
       const listeners = new Set()
-      const recent = []
+      /*
+       * 回填**按会话分开存**。
+       *
+       * 只留一条全局队列的话，手动钉住一个安静了十分钟的会话时，它的最后几条早就被别的会话
+       * 挤出去了 —— 于是"切过去"看到的是空白，而这正是那个人点菜单的原因。
+       */
+      const recentBySession = new Map()
+      /** 会话 id -> { id, title, lastAt, lastText, events }：会话选择菜单的数据源。 */
+      const knownSessions = new Map()
+      /** 会话 id -> Session 对象。`sessionTitle.get()` 要的是对象，不是 id。 */
+      const sessionObjects = new Map()
+      /** 手动钉住的会话。空串 = 自动跟随最活跃的那个。 */
+      let focusedSession = ''
       /** 会话 id -> 这一轮最后一段助手文本，用来判断「结束但没有回复」。 */
       const lastAnswer = new Map()
       /** 只在诊断里用：一共播出去多少条。 */
@@ -409,6 +427,111 @@ export default {
       let activeSession = ''
       /** 活跃会话的标题，只为把切换提示写得像人话。 */
       let activeTitle = ''
+
+      /*
+       * 标题：会话菜单里如果只有一串 `session-266cb42a…`，选了也不知道选的是谁。
+       *
+       * 用 `ctx.get('sessionTitle')` 而不是 `ctx.sessionTitle`：后者要写进 inject 才是合法访问，
+       * 而标题只是个锦上添花的东西，不值得为它把整个半边变成硬依赖（第 1 条坑的同一道理）。
+       * 解析一次就缓存起来。
+       */
+      let titleService
+      let titleServiceResolved = false
+      function resolveTitleService() {
+        if (!titleServiceResolved) {
+          titleServiceResolved = true
+          try {
+            titleService = ctx.get('sessionTitle') ?? null
+          } catch {
+            titleService = null
+          }
+        }
+        return titleService
+      }
+
+      function titleOf(sessionId, inlineTitle) {
+        if (typeof inlineTitle === 'string' && inlineTitle !== '') return inlineTitle
+        const session = sessionObjects.get(sessionId)
+        if (session === undefined) return ''
+        try {
+          const service = resolveTitleService()
+          if (service === null || typeof service.get !== 'function') return ''
+          const snapshot = service.get(session)
+          return typeof snapshot?.title === 'string' ? snapshot.title : ''
+        } catch {
+          /* 标题服务闹脾气不该影响弹幕，退回 id 前缀就好。 */
+          return ''
+        }
+      }
+
+      /** 记下"这个会话最近在干什么"。所有 root 会话都记，不管现在播的是哪一个。 */
+      function rememberSession(sessionId, text, inlineTitle) {
+        if (sessionId === '') return
+        const title = titleOf(sessionId, inlineTitle)
+        const existing = knownSessions.get(sessionId)
+        if (existing === undefined) {
+          /* 重新插入让它排到队尾，顺便当作 LRU 的"最近使用"。 */
+          knownSessions.set(sessionId, { id: sessionId, title, lastAt: Date.now(), lastText: text, events: 1 })
+          while (knownSessions.size > SESSION_MEMORY) {
+            const oldest = knownSessions.keys().next()
+            if (oldest.done === true) break
+            /* 正在看的那个不能被清理掉，否则菜单里会缺一条。 */
+            if (oldest.value === activeSession || oldest.value === focusedSession) break
+            knownSessions.delete(oldest.value)
+          }
+          return
+        }
+        existing.title = title === '' ? existing.title : title
+        existing.lastAt = Date.now()
+        if (text !== '') existing.lastText = text
+        existing.events += 1
+      }
+
+      /** 留着 Session 对象只为一件事：向 sessionTitle 服务要标题（它要对象，不要 id）。 */
+      function rememberSessionObject(sessionId, session) {
+        sessionObjects.delete(sessionId)
+        sessionObjects.set(sessionId, session)
+        while (sessionObjects.size > SESSION_MEMORY) {
+          const oldest = sessionObjects.keys().next()
+          if (oldest.done === true) break
+          sessionObjects.delete(oldest.value)
+        }
+      }
+
+      /** 菜单里的排序键：最近说过话的排前面。 */
+      function sessionList() {
+        const list = [...knownSessions.values()]
+        list.sort((left, right) => right.lastAt - left.lastAt)
+        return list.map((entry) => ({
+          id: entry.id,
+          title: entry.title,
+          lastAt: entry.lastAt,
+          lastText: entry.lastText,
+          events: entry.events,
+        }))
+      }
+
+      function rememberRecent(event) {
+        const key = typeof event.session === 'string' ? event.session : ''
+        let list = recentBySession.get(key)
+        if (list === undefined) {
+          list = []
+          recentBySession.set(key, list)
+        }
+        list.push(event)
+        if (list.length > RECENT_PER_SESSION) list.splice(0, list.length - RECENT_PER_SESSION)
+      }
+
+      /** 回填：钉住了就只给那一个会话，否则把所有会话按时间混起来取最后一段。 */
+      function eventsForBackfill() {
+        if (focusedSession !== '') return (recentBySession.get(focusedSession) ?? []).slice()
+        const all = []
+        for (const list of recentBySession.values()) {
+          for (const event of list) all.push(event)
+        }
+        all.sort((left, right) => (left.at ?? 0) - (right.at ?? 0))
+        return all.slice(-RECENT_LIMIT)
+      }
 
       function rememberAnswer(sessionId, text) {
         if (sessionId === '') return
@@ -468,57 +591,82 @@ export default {
 
       function push(event) {
         published += 1
-        recent.push(event)
-        if (recent.length > RECENT_LIMIT) recent.splice(0, recent.length - RECENT_LIMIT)
+        rememberRecent(event)
         broadcast(event)
       }
 
       /**
        * 播一条事件，并维护"现在是哪个会话"。
        *
-       * 规则只有三条，但要紧的是第一条：**用户消息是锚**。用户在自己看的那个会话里发话，
-       * 就等于告诉我们他在看谁；其余事件（工具、助手文本）只跟着锚走，不抢。
-       * 没有锚的时候（刚启动、或者这一轮还没有用户消息）就用第一条带会话的事件落位。
+       * 会话归属四条规则，按顺序：
+       *
+       *   1. **子代理的会话不播**（`isRootSession`）——主会话派一个子代理出去，画面不该跟着它走；
+       *   2. **手动钉住的会话优先**——用户从菜单里选了谁就是谁，用户消息也不再自动把画面带走；
+       *   3. **用户消息是锚**——没钉住时，用户在哪个会话里发话，就等于告诉我们他在看谁；
+       *   4. 没有锚时（刚启动、或者这一轮还没有用户消息）用第一条带会话的事件落位。
+       *
+       * 而且不管播不播，**每个 root 会话的活动都要记进 `knownSessions`**：会话菜单要能显示
+       * "另一个会话最后在干什么" —— 那正是用户决定要不要切过去看的东西。先按规则过滤再记账的话，
+       * 菜单里就只剩当前这一个会话了。
        */
       function publish(event) {
         const sessionId = typeof event.session === 'string' ? event.session : ''
         const title = typeof event.sessionTitle === 'string' ? event.sessionTitle : ''
 
-        if (sessionId !== '') {
-          if (!isRootSession(sessionId)) return
-          if (event.anchor === true) {
-            if (activeSession !== sessionId) {
-              activeSession = sessionId
-              activeTitle = title
-              push({
-                kind: 'session:switch',
-                text: `跟着你切到 ${sessionLabel(sessionId, title)}`,
-                detail: '',
-                session: sessionId,
-                sessionTitle: title,
-                at: Date.now(),
-              })
-            } else if (title !== '') {
-              activeTitle = title
-            }
-          } else if (activeSession === '') {
-            activeSession = sessionId
-            activeTitle = title
-          } else if (activeSession !== sessionId) {
-            return
-          } else if (title !== '') {
-            activeTitle = title
-          }
+        if (sessionId === '') {
+          const loose = interpret(event)
+          if (loose === null) return
+          push({
+            kind: loose.kind,
+            text: loose.text,
+            detail: loose.detail,
+            session: '',
+            sessionTitle: '',
+            tool: typeof event.tool === 'string' ? event.tool : '',
+            reason: typeof event.reason === 'string' ? event.reason : '',
+            at: Date.now(),
+          })
+          return
         }
 
+        if (!isRootSession(sessionId)) return
+
         const spoken = interpret(event)
+        rememberSession(sessionId, spoken === null ? '' : spoken.text, title)
+
+        if (focusedSession !== '') {
+          if (sessionId !== focusedSession) return
+          activeSession = sessionId
+          activeTitle = knownSessions.get(sessionId)?.title || title
+        } else if (event.anchor === true) {
+          if (activeSession !== sessionId) {
+            activeSession = sessionId
+            activeTitle = knownSessions.get(sessionId)?.title || title
+            push({
+              kind: 'session:switch',
+              text: `跟着你切到 ${sessionLabel(sessionId, activeTitle)}`,
+              detail: '',
+              session: sessionId,
+              sessionTitle: activeTitle,
+              at: Date.now(),
+            })
+          } else {
+            activeTitle = knownSessions.get(sessionId)?.title || title
+          }
+        } else if (activeSession === '') {
+          activeSession = sessionId
+          activeTitle = knownSessions.get(sessionId)?.title || title
+        } else if (activeSession !== sessionId) {
+          return
+        }
+
         if (spoken === null) return
         push({
           kind: spoken.kind,
           text: spoken.text,
           detail: spoken.detail,
           session: sessionId,
-          sessionTitle: sessionId === activeSession ? activeTitle : title,
+          sessionTitle: activeTitle,
           tool: typeof event.tool === 'string' ? event.tool : '',
           reason: typeof event.reason === 'string' ? event.reason : '',
           at: Date.now(),
@@ -566,6 +714,8 @@ export default {
         if (event === null || event === undefined) return
         const sessionId = typeof session?.id === 'string' ? session.id : ''
         const sessionTitle = typeof session?.title === 'string' ? session.title : ''
+        /* 只有这条事件源给得出 Session 对象，标题也就只能从这里问。 */
+        if (sessionId !== '' && session !== null && session !== undefined) rememberSessionObject(sessionId, session)
         const data = event.data
         if (data === null || data === undefined) return
 
@@ -702,12 +852,14 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v2',
+                build: 'v3',
                 active: activeSession,
                 activeTitle,
-                sessions: lastAnswer.size,
+                focused: focusedSession,
+                sessionCount: knownSessions.size,
+                sessions: sessionList(),
                 events: published,
-                recent: recent.length,
+                backfill: eventsForBackfill().length,
                 clients: listeners.size,
                 streamOpens,
                 lastStreamError,
@@ -733,12 +885,96 @@ export default {
                *
                * 前端迟到（刷新、overlay 重新露面）时，它能拿到的只有这份 JSON；只给一串事件的话，
                * 它没有依据判断哪些还该显示——跟随会话这件事是在 host 这边决定的，所以答案也得从
-               * 这边给出去。
+               * 这边给出去。`focused` 一并带上，菜单才能把当前选中的那一项标出来。
                */
-              sendJson(res, 200, { active: activeSession, activeTitle, events: recent })
+              sendJson(res, 200, {
+                active: activeSession,
+                activeTitle,
+                focused: focusedSession,
+                events: eventsForBackfill(),
+              })
             },
           }),
         'dsh-danmaku:route:recent',
+      )
+
+      /*
+       * 会话列表：菜单的数据源。
+       *
+       * 只列 `knownSessions`（见过事件的 root 会话），不列 `agents.roots()` 的全集 ——
+       * 后者里有一堆从没说过话的会话，菜单里除了 id 什么都显示不出来，选了也是空白。
+       */
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/sessions`,
+            handler: (req, res) => {
+              sendJson(res, 200, {
+                active: activeSession,
+                focused: focusedSession,
+                sessions: sessionList(),
+              })
+            },
+          }),
+        'dsh-danmaku:route:sessions',
+      )
+
+      /*
+       * 钉住一个会话，或者用空串恢复自动跟随。
+       *
+       * 为什么钉住要由 **host** 记：跟随会话本来就是在 host 这边决定的（它知道谁是 root、
+       * 谁是子代理、谁最近说过话）。把它挪到前端，等于要每个页面各自维护一份同样的判断，
+       * 而且它们会互相打架——DSH 页面和桌面 overlay 是同一份代码的两个副本，落在两个窗口里。
+       */
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/focus`,
+            handler: async (req, res) => {
+              if (req.method !== 'POST') {
+                sendJson(res, 405, { ok: false, error: 'POST only' })
+                return
+              }
+              const body = await readBody(req)
+              const wanted = typeof body?.sessionId === 'string' ? body.sessionId : ''
+
+              if (wanted !== '' && !knownSessions.has(wanted)) {
+                /*
+                 * 只接受见过的会话。否则一个过期的 id 会把浮层钉在一个永远不会有事件的会话上，
+                 * 表现为"弹幕忽然全没了"，而且没有任何提示 —— 比拒绝难查得多。
+                 */
+                sendJson(res, 404, { ok: false, error: '没有这个会话', focused: focusedSession })
+                return
+              }
+
+              focusedSession = wanted
+              if (wanted !== '') {
+                activeSession = wanted
+                activeTitle = knownSessions.get(wanted)?.title || ''
+              }
+
+              /*
+               * 推一条 session:switch，让**所有**开着的前端一起切。
+               *
+               * 两个宿主各自持有一条 SSE，只在发起的那一个里改状态的话，另一个会继续显示上一个
+               * 会话的气泡 —— 桌面窗口和 DSH 页面里的弹幕对不上，而且没人会想到是这个原因。
+               */
+              const label = wanted === '' ? '' : knownSessions.get(wanted)?.title || ''
+              push({
+                kind: 'session:switch',
+                text: wanted === '' ? '恢复自动跟随' : `钉住 ${sessionLabel(wanted, label)}`,
+                detail: '',
+                session: wanted === '' ? activeSession : wanted,
+                sessionTitle: wanted === '' ? activeTitle : label,
+                at: Date.now(),
+              })
+
+              sendJson(res, 200, { ok: true, focused: focusedSession, active: activeSession })
+            },
+          }),
+        'dsh-danmaku:route:focus',
       )
 
       ctx.effect(

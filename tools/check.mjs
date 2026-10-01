@@ -117,6 +117,10 @@ async function checkHost() {
         return { accepted: true }
       },
     },
+    /* 会话标题：菜单里如果只有一串 id，选了也不知道选的是谁。 */
+    sessionTitle: {
+      get: () => ({ title: '测试会话' }),
+    },
     timer: {
       interval() {
         return () => {}
@@ -194,11 +198,11 @@ async function checkHost() {
 
   // -- 路由 ---------------------------------------------------------------- //
 
-  for (const path of ['frontend', 'status', 'recent', 'send', 'stream']) {
+  for (const path of ['frontend', 'status', 'recent', 'send', 'stream', 'sessions', 'focus']) {
     const suffix = path === 'frontend' ? FRONT_URL : `/dsh-danmaku/v3/${path}`
     assert.ok(routes.has(suffix), `路由没注册：${suffix}`)
   }
-  ok('五条路由全部注册')
+  ok('七条路由全部注册')
 
   const frontend = fakeResponse()
   routes.get(FRONT_URL).handler(fakeRequest(), frontend)
@@ -268,6 +272,73 @@ async function checkHost() {
   const sent = JSON.parse(send.state.body)
   assert.equal(sent.ok, true, `send 路由没有把 prompt 送出去：${send.state.body}`)
   ok('send 路由把话送进会话')
+
+  // -- 会话菜单：列表、钉住、恢复 -------------------------------------------- //
+
+  const listResponse = fakeResponse()
+  routes.get('/dsh-danmaku/v3/sessions').handler(fakeRequest(), listResponse)
+  const list = JSON.parse(listResponse.state.body)
+  assert.equal(list.focused, '', '一开始应当是自动跟随')
+  const ids = list.sessions.map((row) => row.id)
+  assert.ok(
+    ids.includes('session-a') && ids.includes('session-b') && ids.includes('session-c'),
+    '会话列表缺了见过的会话（记账必须发生在"播不播"的判断之前）',
+  )
+  assert.ok(!ids.includes('subagent-1'), '子代理的会话不该出现在菜单里')
+  ok('GET /sessions 列出见过的 root 会话（不含子代理）')
+
+  assert.equal(
+    list.sessions.find((row) => row.id === 'session-c').title,
+    '测试会话',
+    '标题没有从 sessionTitle 服务取到',
+  )
+  assert.equal(list.sessions.find((row) => row.id === 'session-b').title, '搬弹幕', '事件自带的标题没有优先')
+  ok('会话标题：事件自带优先，取不到才问 sessionTitle 服务')
+
+  assert.ok(
+    list.sessions.every((row) => typeof row.lastText === 'string'),
+    '会话行没有"最后在干什么"',
+  )
+  ok('每一行都带"最后在干什么"')
+
+  const focusRoute = routes.get('/dsh-danmaku/v3/focus')
+
+  const pinned = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: 'session-c' }), pinned)
+  assert.equal(JSON.parse(pinned.state.body).focused, 'session-c', '钉住没有生效')
+  ok('POST /focus 钉住一个会话')
+
+  const beforeOther = stream.state.frames.length
+  sessionEvent({ id: 'session-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '别的会话又在说话' }] } } })
+  assert.equal(stream.state.frames.length, beforeOther, '钉住之后还播了别的会话')
+  ok('钉住之后只播这一个会话')
+
+  const beforeOwn = stream.state.frames.length
+  sessionEvent({ id: 'session-c' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '就是我' }] } } })
+  assert.ok(stream.state.frames.length > beforeOwn, '钉住的会话自己说话也没播')
+  ok('钉住的会话照常上屏')
+
+  const pinnedBackfill = fakeResponse()
+  routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), pinnedBackfill)
+  const pinnedPayload = JSON.parse(pinnedBackfill.state.body)
+  assert.equal(pinnedPayload.focused, 'session-c')
+  assert.ok(pinnedPayload.events.length > 0, '钉住之后回填是空的')
+  assert.ok(
+    pinnedPayload.events.every((event) => event.session === 'session-c'),
+    '钉住时回填里混进了别的会话',
+  )
+  ok('钉住时回填只含该会话')
+
+  const bogus = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: 'session-nope' }), bogus)
+  assert.equal(bogus.state.status, 404, '没见过的会话没有被拒绝')
+  assert.equal(JSON.parse(bogus.state.body).focused, 'session-c', '被拒之后状态不该变')
+  ok('POST /focus 拒绝没见过的会话，且不改状态')
+
+  const resumed = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: '' }), resumed)
+  assert.equal(JSON.parse(resumed.state.body).focused, '', '空串没有恢复自动跟随')
+  ok('POST /focus 空串恢复自动跟随')
 
   return { routes, handlers, ctx }
 }
@@ -350,7 +421,9 @@ class FakeNode {
   }
 
   get textContent() {
-    return this._text
+    /* 真实 DOM 会聚合子节点。菜单项正是靠 appendChild 拼出来的，不聚合就只能读到空串。 */
+    if (this.children.length === 0) return this._text
+    return this.children.map((child) => child.textContent).join('')
   }
 
   set textContent(value) {
@@ -369,6 +442,12 @@ class FakeNode {
     if (index >= 0) this.children.splice(index, 1)
     child.parentNode = null
     return child
+  }
+
+  /** 真实 DOM 的标准 API，前端用它判断"点的是不是菜单按钮自己"。 */
+  contains(node) {
+    if (node === this) return true
+    return this.children.some((child) => child.contains(node))
   }
 
   addEventListener(type, listener) {
@@ -440,14 +519,45 @@ class FakeEventSource {
   static instances = []
 }
 
-function fakeFetch(url) {
-  fakeFetch.calls.push(String(url))
-  const body = String(url).includes('/recent') ? { active: '', events: [] } : { ok: true }
+function fakeFetch(url, options) {
+  const target = String(url)
+  fakeFetch.calls.push({ url: target, method: options?.method ?? 'GET', body: String(options?.body ?? '') })
+
+  if (target.includes('/sessions')) {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          active: 'session-a',
+          focused: '',
+          sessions: [
+            { id: 'session-a', title: '读代码', lastAt: Date.now(), lastText: '正在读取 lib/index.js', events: 3 },
+            /* 第二个故意没有标题：菜单该退回短 id，而不是显示空行。 */
+            { id: 'session-b', title: '', lastAt: Date.now() - 120000, lastText: '我说：你好', events: 1 },
+          ],
+        }),
+    })
+  }
+
+  if (target.includes('/focus')) {
+    const wanted = JSON.parse(String(options?.body ?? '{}')).sessionId ?? ''
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true, focused: wanted, active: wanted === '' ? 'session-a' : wanted }),
+    })
+  }
+
+  const body = target.includes('/recent') ? { active: '', focused: '', events: [] } : { ok: true }
   return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) })
 }
 fakeFetch.calls = []
 
-function checkFrontend() {
+/** 让 fetch 的 then 链跑完。vm 里的 Promise 也是标准 Promise，跨 realm await 一样有效。 */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+async function checkFrontend() {
   /* document 上的监听器：拖动靠 document 上的 mousemove / mouseup，Esc 关详情靠 keydown。 */
   const documentListeners = new Map()
   const document = {
@@ -513,7 +623,10 @@ function checkFrontend() {
 
   assert.equal(FakeEventSource.instances.length, 1, '没有建 SSE 连接')
   assert.ok(FakeEventSource.instances[0].url.endsWith('/dsh-danmaku/v3/stream'), 'SSE 地址不对')
-  assert.ok(fakeFetch.calls.some((url) => url.includes('/recent')), '没有回填请求')
+  assert.ok(
+    fakeFetch.calls.some((call) => call.url.includes('/recent')),
+    '没有回填请求',
+  )
   ok('SSE 连接 + recent 回填')
 
   const source = FakeEventSource.instances[0]
@@ -580,6 +693,43 @@ function checkFrontend() {
   assert.equal(root.style.top, '190px', '拖动没有把浮层挪过去')
   assert.equal(storage.get('dsh-danmaku:pos:page'), '{"left":490,"top":190}', '拖动后的位置没有记进 localStorage')
   ok('拖动 + 位置记忆')
+
+  /* 会话菜单：开关、列表、选择、点外面收起。 */
+  const menuButton = findByTitle(root, '选择要看哪个会话')
+  assert.ok(menuButton !== null, '找不到会话菜单按钮')
+  const menu = findByClass(root, 'dshd-menu')
+  assert.ok(menu !== null, '找不到菜单容器')
+
+  menuButton.dispatch('click')
+  assert.ok(menu.classList.contains('dshd-open'), '点 ☰ 没有打开菜单')
+  await flush()
+  await flush()
+
+  const items = []
+  walk(menu, (node) => {
+    if (node.classList.contains('dshd-item')) items.push(node)
+  })
+  assert.equal(items.length, 3, `菜单应当是"自动跟随 + 两个会话"，实际 ${String(items.length)} 项`)
+  assert.ok(items[0].textContent.includes('自动跟随'), '第一项不是自动跟随')
+  assert.equal(items[2].title, 'session-b', '完整 id 应当挂在 title 上')
+  assert.ok(items[2].textContent.includes('session-'), '没有标题的会话应当退回短 id 而不是空行')
+  ok('☰ 打开菜单：自动跟随 + 会话（没标题就退回短 id）')
+
+  const beforeFocus = fakeFetch.calls.filter((call) => call.url.includes('/focus')).length
+  items[2].dispatch('click')
+  await flush()
+  await flush()
+  const focusCalls = fakeFetch.calls.filter((call) => call.url.includes('/focus'))
+  assert.equal(focusCalls.length, beforeFocus + 1, '点会话项没有发出 /focus')
+  assert.ok(focusCalls[focusCalls.length - 1].body.includes('session-b'), '/focus 的 body 里不是点中的那个会话')
+  assert.ok(!menu.classList.contains('dshd-open'), '选完之后菜单没有收起')
+  ok('点一个会话 → POST /focus 并收起菜单')
+
+  menuButton.dispatch('click')
+  assert.ok(menu.classList.contains('dshd-open'), '菜单没打开')
+  document.dispatch('mousedown', { target: root })
+  assert.ok(!menu.classList.contains('dshd-open'), '点别处没有收起菜单')
+  ok('点别处收起菜单')
 }
 
 // --------------------------------------------------------------------------- //
@@ -587,5 +737,5 @@ function checkFrontend() {
 console.log('host 半边：')
 await checkHost()
 console.log('前端：')
-checkFrontend()
+await checkFrontend()
 console.log(`\n全部通过（${String(passed)} 项）`)

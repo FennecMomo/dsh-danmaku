@@ -37,6 +37,11 @@ function argument(name, fallback) {
 const PORT = Number(argument('--port', process.env.DSH_DANMAKU_PORT ?? '19387'))
 const ORIGIN = `http://127.0.0.1:${String(PORT)}`
 const FRONT_URL = '/dsh-danmaku/v3/bubbles.js'
+/*
+ * 期望的 host 版本，与 `lib/index.js` 里 status 的 `build` 字段一致。
+ * 改了 host 就把它跟着 +1 —— "重启之后自检该不该全绿"因此只看一处。
+ */
+const EXPECTED_BUILD = 'v3'
 
 let failed = 0
 let skipped = 0
@@ -101,16 +106,16 @@ try {
     fail('host 半边应答', `HTTP ${String(response.status)}（路由没注册，或者插件没启用）`)
   } else {
     status = JSON.parse(text)
-    if (status.build === 'v2') {
+    if (status.build === EXPECTED_BUILD) {
       pass('host 半边是新代码', `build ${String(status.build)}`)
     } else {
       fail(
         'host 半边是新代码',
-        `build=${String(status.build)} —— 跑的还是旧模块，改完 host 代码必须重启客户端（禁用再启用不算）`,
+        `build=${String(status.build)}，期望 ${EXPECTED_BUILD} —— 跑的还是旧模块，改完 host 代码必须重启客户端（禁用再启用不算）`,
       )
     }
-    /* 旧模块没有这两个诊断字段，所以先认 build：拿不到就不假装检查过了。 */
-    if (status.build !== 'v2') {
+    /* 旧模块没有这几个诊断字段，所以先认 build：认不出来就不假装检查过了。 */
+    if (status.build !== EXPECTED_BUILD) {
       skip('SSE handler 没抛过错', '旧模块没有这个诊断字段')
     } else if (typeof status.lastStreamError === 'string' && status.lastStreamError !== '') {
       fail('SSE handler 没抛过错', status.lastStreamError.split('\n')[0])

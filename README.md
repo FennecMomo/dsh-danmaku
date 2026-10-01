@@ -18,7 +18,7 @@ DSH（DeepSeek Harness）的**弹幕浮层**：把当前会话正在做的事变
 | --- | --- |
 | [`plugin/`](plugin/README.md) | DSH 插件包：会话事件 → 一句话、SSE/回填/发送、把前端注进页面 |
 | [`plugin/lib/bubbles.js`](plugin/lib/bubbles.js) | 前端本体：一份自包含脚本，两个宿主共用 |
-| [`tools/check.mjs`](tools/check.mjs) | 离线自检（23 项），两半都能在 Node 里跑 |
+| [`tools/check.mjs`](tools/check.mjs) | 离线自检（35 项），两半都能在 Node 里跑 |
 
 两个宿主是同一个文件：
 
@@ -37,13 +37,20 @@ DSH（DeepSeek Harness）的**弹幕浮层**：把当前会话正在做的事变
 
 - **点气泡** → 展开全文。带工具参数、完整回复；`Esc` 或 `×` 收起，`复制` 拿走全文。
   没有详情的气泡点不动 —— 开一个正文和气泡上一模一样的窗口，比不开更糟。
+- **☰** → 选要看哪个会话的弹幕。第一项是「自动跟随」（谁在说话就看谁），下面列出最近说过话的会话：
+  有标题就显示标题、没有就退回 id 前八位，每行还带着"多久之前 · 最后一句"。选中项高亮，按钮在
+  钉住状态下变蓝；想回到自动模式就再点一次「自动跟随」。
 - **✎** → 展开一行输入框，`Enter` 发送给当前会话（走 `sessionController.prompt`，`queue` 模式，
   不会打断正在跑的一轮）。发失败时内容会留着，不会静默吞掉。
 - **◐** → 淡出/恢复。淡出态同时**不可点**（"别挡着我"这个状态里，一个还吞点击的淡方块是个陷阱）。
 - **最多同时 6 颗气泡**，旧的在顶上被挤掉：这是一个"正在发生什么"的窗口，不是历史记录。
 
-弹幕跟着**最近活跃的会话**走：你在哪个会话里说话，它就跟到哪儿（规则细节见
-[`plugin/README.md`](plugin/README.md#弹幕跟着哪个会话)）。子代理的会话不会把画面抢走。
+默认弹幕跟着**最近活跃的会话**走：你在哪个会话里说话，它就跟到哪儿；子代理的会话不会把画面抢走。
+想固定看某一个，用 `☰` 钉住它 —— 钉住之后连用户消息也不会再把画面带走（规则细节见
+[`plugin/README.md`](plugin/README.md#弹幕跟着哪个会话)）。
+
+钉住这件事记在 **host** 那边，不是每个页面各记一份：DSH 页面和桌面 overlay 是同一份代码的两个副本，
+各记各的话，两个窗口里显示的会是不同会话的弹幕。
 
 ## 装它
 
@@ -70,7 +77,7 @@ dsh plugin --profile web add link:D:\Projects\dsh-plugins\dsh-danmaku\plugin
 ## 自检
 
 ```powershell
-node tools/check.mjs                            # 离线：假 root + 假 ctx 跑 host，最小 DOM 跑前端（23 项）
+node tools/check.mjs                            # 离线：假 root + 假 ctx 跑 host，最小 DOM 跑前端（35 项）
 node tools/verify-live.mjs                      # 现场：问正在跑的那台机器六个问题
 node tools/verify-page.mjs                      # 页面：独立无头 Edge 打开真实 DSH 页面（自动注入那份）
 node tools/verify-page.mjs --url /dsh-overlay   # 页面：换 overlay 那个宿主
@@ -101,7 +108,7 @@ DSH 的 index 里有前端 loader、overlay 页面里有同一份脚本。重启
 
 | 检查 | 结果 |
 | --- | --- |
-| 离线自检 `tools/check.mjs` | ✅ 23 项 |
+| 离线自检 `tools/check.mjs` | ✅ 35 项 |
 | host 半边真机热装后可用 | ✅ `/dsh-danmaku/v3/status` 200，`active` 正确指向当前会话，事件在采 |
 | 前端在**真实 DSH 页面**里 | ✅ 建根节点、回填 3 条气泡、无 JS 错误（CDP 手工注入验证） |
 | 前端**交互**（真机） | ✅ 点气泡开详情（标题/正文正确、`Esc` 能关）、◐ 淡化到 0.24 再恢复、✎ 展开/收起输入条、拖动把位置写进 localStorage |
