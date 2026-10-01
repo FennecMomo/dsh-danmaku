@@ -101,8 +101,6 @@ powershell -NoProfile -File stop-panel.ps1
 | --- | --- |
 | `probe_alpha.pyw` | 列出匹配的窗口（含 PID、可见性）。`--printwindow` 可选，**会卡，不要随便加** |
 | `compare_render.pyw` | 画一颗气泡，对比「绘制缓冲」和「屏幕截图」，用来区分「画错了」和「Windows 混合得不一样」 |
-| `layered_check.pyw` | 渲染器冒烟测试 |
-| `check-click-through.js` | 检查窗口的命中测试 |
 
 `probe_alpha.pyw` 的 `BitBlt` 路径读 layered 窗口的 DC 只会得到全 0；
 `PrintWindow` 能读到内容，但它是跨进程同步请求，目标忙的时候没有超时，会挂住。
@@ -130,14 +128,15 @@ Windows 不是接上去，而是**直接丢掉**。实测连续三次：同一�
 所以探测拿不到答案，按钮一直显示「已关闭」，而面板其实开着。
 启动仍然用 `pythonw`，否则悬浮窗后面会闪一个黑框。
 
-**2. 启动走 `subprocess.spawn`，探测走 `shell.run`，不能互换。**
+**2. 启动走 `subprocess.spawn`，探测走 `ctx.shell`，不能互换。**
 
 `ctx.shell` 在命令结束时**会连带杀掉整棵进程树**。用它 `Start-Process` 起的
 面板活不过几秒 —— 而且死得很安静：面板已经把启动日志写出来了，
 所以看起来像「启动就崩」，其实是「被杀了」。同一个命令两边都试过：
 走 `ctx.shell` 每次都消失，走我自己的 shell 十秒后还在。
 
-反过来，探测只能用 `shell.run`，因为只有它的返回值带 stdout。
+反过来，探测只能用 `ctx.shell`，因为只有它的结果带 stdout —— 入口是
+`execute(spec)` 拿活句柄，再 `await handle.result()` 拿 `stdout` / `exitCode`。
 `subprocess` 的完成结果无论 `stdio` 怎么写都只有 `{ exitCode, signal }`。
 探测本身不启动任何东西，所以进程树被杀这件事在这里没有代价。
 

@@ -560,15 +560,6 @@ def discover_base_url(explicit: str | None) -> str | None:
     from_env = os.environ.get("DSH_WEB_URL")
     if from_env:
         return from_env.rstrip("/")
-    log_path = os.path.join(os.environ.get("APPDATA", ""), "dsh-desktop-shell", "desktop-shell.log")
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
-            for line in reversed(handle.readlines()):
-                index = line.find("GUI ready at ")
-                if index != -1:
-                    return line[index + 13 :].strip().split()[0].rstrip("/")
-    except OSError:
-        return None
     return None
 
 

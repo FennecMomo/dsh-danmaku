@@ -30,19 +30,15 @@ Node `req` / `res`，所以页面直接走 HTTP 和这个插件说话。
 ## 路径怎么找
 
 弹幕窗口是 Python，和这个包放在**同一个仓库**里（本仓库的 `danmaku/`）。
-包不从磁盘猜路径，而是：
+包不从磁盘猜路径：入口文件往上两级就是仓库根，`danmaku/` 就在它下面，所以
+仓库搬到哪台机器、放在哪个路径都不用改，直接 `dsh --profile desktop` 也能用。
 
-1. 读 `DSH_DESKTOP_HOME` —— 早先自制的桌面壳启动 harness 时会把自己的目录传进来；
-   官方桌面端不设这个变量，所以这一步在官方壳下会落空
-2. 找不到就退回**本仓库根目录**下的 `danmaku/`。这个位置是算出来的（入口文件往上两级），
-   所以仓库搬到哪台机器、放在哪个路径都不用改，直接 `dsh --profile desktop` 也能用
-
-可用环境变量覆盖：
+面板放在别处时再用环境变量覆盖：
 
 | 变量 | 作用 |
 |---|---|
-| `DSH_DESKTOP_HOME` | 桌面壳目录；`danmaku/` 就在它下面（官方桌面端不设它） |
 | `DSH_DANMAKU_DIR` | 直接指定弹幕目录 |
+| `DSH_DESKTOP_HOME` | 指定一个目录，包在它下面找 `danmaku/` |
 | `DSH_DANMAKU_PYTHON_DIR` | 含有 `python.exe` / `pythonw.exe` 的目录 |
 
 ## 安装

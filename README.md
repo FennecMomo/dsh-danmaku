@@ -46,12 +46,9 @@ powershell -NoProfile -File danmaku\stop-panel.ps1
 面板的实现、三个踩过的坑（GDI 不写 alpha、透明不等于点得到、窗口跟着内容收缩）、
 以及所有设置项，写在 [`danmaku/README.md`](danmaku/README.md)。
 
-## 已知待办
+## 状态
 
-- **`ctx.shell.run(spec)` 在当前 DSH 上已经不存在。** 现在的 `shell` 服务只有 `resolve` 和
-  `execute` 两个方法，而且 `execute` 返回的是活句柄，要再 `await handle.result()` 才拿到
-  `stdout` / `exitCode`。宿主半边探测面板状态（以及停止面板）走的就是这条路，移植到官方
-  桌面端之前必须把这一处改成两段式调用。
-- 文档里有些说法是旧桌面壳时代的：profile 名已经从 `web` 变成 `desktop`，
-  `DSH_DESKTOP_HOME` 官方壳也不再设置（插件的路径回退到本仓库的 `danmaku/`，
-  所以只要两者在同一个仓库里，不设也能找到）。
+- 宿主半边探测面板状态（以及停止面板）走的是 `ctx.shell`。这个方法在当前 DSH（0.2.0-rc.2）
+  上已经从 `run(spec)` 变成了两段式：`execute(spec)` 拿活句柄，再 `await handle.result()`
+  拿 `stdout` / `exitCode`。仓库里已经按新契约改好，但**还没有装进 profile 在真机上跑过**，
+  别当它已经验证可用。

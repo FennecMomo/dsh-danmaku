@@ -28,20 +28,17 @@
 /*
  * Where everything lives.
  *
- * The overlay is Python and sits beside the shell, not inside this package, so
- * these paths have to be found rather than assumed. `DSH_DESKTOP_HOME` is set by
- * the desktop shell to its own directory; the fallback is the machine this was
- * developed on, so the plugin still works when the CLI runs the profile directly
- * (a plain `dsh --profile desktop`, with no shell involved).
+ * The overlay is Python and sits beside this package inside the same repository,
+ * so its directory is derived rather than assumed: `plugin/lib` -> the repository
+ * root -> `danmaku/`. That is what keeps the checkout portable - the repository
+ * can live anywhere on any machine and nothing here needs editing.
  *
- * Hard-coding only the fallback is what makes this portable: on another machine
- * the shell exports its own location and nothing here needs editing.
+ * Both path overrides are optional, for the case where the panel is kept outside
+ * this repository; with neither set, the panel is the one here.
  */
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-
-const SHELL_HOME = process.env.DSH_DESKTOP_HOME ?? 'E:/etc/dsh/desktop'
 
 /** The repository this package lives in: `<repo>/plugin/lib` -> `<repo>`. */
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -54,8 +51,15 @@ function firstExisting(candidates, fallback) {
 }
 
 const PANEL_DIR = firstExisting(
-  [process.env.DSH_DANMAKU_DIR, join(SHELL_HOME, 'danmaku'), join(PACKAGE_ROOT, 'danmaku')],
-  join(SHELL_HOME, 'danmaku'),
+  [
+    process.env.DSH_DANMAKU_DIR,
+    /* A directory named by a desktop shell, when one launched this Host. */
+    process.env.DSH_DESKTOP_HOME === undefined
+      ? undefined
+      : join(process.env.DSH_DESKTOP_HOME, 'danmaku'),
+    join(PACKAGE_ROOT, 'danmaku'),
+  ],
+  join(PACKAGE_ROOT, 'danmaku'),
 )
 const PANEL_SCRIPT = join(PANEL_DIR, 'danmaku_panel.pyw')
 const STOP_SCRIPT = join(PANEL_DIR, 'stop-panel.ps1')
@@ -415,7 +419,11 @@ export function apply(ctx) {
 
   async function runShell(command, timeoutMs) {
     const spec = ctx.shell.resolve({ command, workdir: PANEL_DIR, timeoutMs })
-    const result = await ctx.shell.run(spec)
+    /* `execute` hands back a live handle, not a finished result - the result
+       projection is a second await. An older DSH exposed this as one `run(spec)`
+       call that returned the result directly, and that method is gone. */
+    const handle = await ctx.shell.execute(spec)
+    const result = await handle.result()
     const stdout = result?.stdout?.text
     const stderr = result?.stderr?.text
     return {
