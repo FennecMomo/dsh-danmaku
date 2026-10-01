@@ -1,97 +1,91 @@
 /**
- * Danmaku overlay: the event bridge and the panel control, as a real plugin.
+ * dsh-danmaku —— host 半边
  *
- * Why this is a package and not a dynamic plugin
- * ----------------------------------------------
- * A dynamic Cordis plugin lives only inside the running process. On the next
- * restart it is gone: no rows to compose, so the session-header button simply
- * does not exist and there is nothing to click. That is fine for a probe and
- * wrong for a feature, so the whole thing lives here and loads from the profile's
- * `cordis.patch.yml` on every start.
+ * 弹幕以前是一个自己画的 Win32 悬浮窗（layered window + GDI 逐像素 alpha + 光标轮询点击）。
+ * 那整套东西存在的唯一理由，是「要一个透明、置顶、点得到下面的窗口」；而这件事现在由
+ * `dsh-desktop-overlay` 的 Electron 外壳负责了。于是这里退化成一件普通得多的事：
  *
- * Two routes exist because a persistent plugin has no `harness.handle`/`host.call`
- * pair - that RPC belongs to dynamic packages. `webServer.register` hands out
- * plain Node `req`/`res`, so the page talks to this plugin over ordinary HTTP.
- * The other two routes are the SSE stream and recent-event JSON the Python panel
- * reads; keeping them here means the panel has no dependency on anything dynamic.
+ *   1. 把会话正在发生的事**读成一句话**（调了哪个工具、动了哪个文件、这轮有没有答完）；
+ *   2. **广播**给前端：SSE 实时流 + recent 回填，两条路都是普通 HTTP；
+ *   3. 把前端脚本**塞进页面**——塞两处：DSH 自己的 index，以及 overlay 页面
+ *      （后者由 overlay 的白名单引入，见 dsh-desktop-overlay 的 `WHITELIST`）。
  *
- *     GET  /dsh-danmaku/v3/status?session=<id>   the button's poll
- *     POST /dsh-danmaku/v3/toggle               open/close the panel
- *     GET  /dsh-danmaku/v3/stream               SSE, live events
- *     GET  /dsh-danmaku/v3/recent               JSON backfill
+ * 透明、置顶、鼠标穿透、点击判定，全部归 overlay；这个文件里没有一行 Win32、
+ * 没有子进程、没有状态文件、没有停止脚本。
  *
- * Every route is registered through `ctx.effect`, so stopping or updating this
- * plugin withdraws all four. A row that leaves a listener or a route behind is
- * how a plugin keeps answering after it is supposed to be gone.
+ *     GET  /dsh-danmaku/v3/bubbles.js   前端本体（按 mtime 热读，改完刷新页面即生效）
+ *     GET  /dsh-danmaku/v3/stream       SSE，实时事件
+ *     GET  /dsh-danmaku/v3/recent       JSON 回填（含「现在是哪个会话」）
+ *     POST /dsh-danmaku/v3/send         把一句话发进会话（前端那条折叠输入框用）
+ *     GET  /dsh-danmaku/v3/status       诊断：活跃会话、客户端数、前端文件状态
+ *
+ * 每条路由都走 `ctx.effect`，所以插件停用/更新时五条一起撤掉。留下一条还在应答的路由，
+ * 就是一个插件"该走了却还在说话"的样子。
  */
-
-/*
- * Where everything lives.
- *
- * The overlay is Python and sits beside this package inside the same repository,
- * so its directory is derived rather than assumed: `plugin/lib` -> the repository
- * root -> `danmaku/`. That is what keeps the checkout portable - the repository
- * can live anywhere on any machine and nothing here needs editing.
- *
- * Both path overrides are optional, for the case where the panel is kept outside
- * this repository; with neither set, the panel is the one here.
- */
-import { existsSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { readFileSync, statSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** The repository this package lives in: `<repo>/plugin/lib` -> `<repo>`. */
-const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
+const HERE = dirname(fileURLToPath(import.meta.url))
+/** 前端本体就在这个文件旁边，按 mtime 热读：改前端只要刷新页面，不必重启 DSH。 */
+const FRONT_FILE = join(HERE, 'bubbles.js')
 
-function firstExisting(candidates, fallback) {
-  for (const candidate of candidates) {
-    if (candidate !== undefined && candidate !== '' && existsSync(candidate)) return candidate
-  }
-  return fallback
-}
+const MOUNT = '/dsh-danmaku/v3'
+const FRONT_URL = `${MOUNT}/bubbles.js`
 
-const PANEL_DIR = firstExisting(
-  [
-    process.env.DSH_DANMAKU_DIR,
-    /* A directory named by a desktop shell, when one launched this Host. */
-    process.env.DSH_DESKTOP_HOME === undefined
-      ? undefined
-      : join(process.env.DSH_DESKTOP_HOME, 'danmaku'),
-    join(PACKAGE_ROOT, 'danmaku'),
-  ],
-  join(PACKAGE_ROOT, 'danmaku'),
-)
-const PANEL_SCRIPT = join(PANEL_DIR, 'danmaku_panel.pyw')
-const STOP_SCRIPT = join(PANEL_DIR, 'stop-panel.ps1')
-
-/*
- * The interpreter, likewise found rather than assumed. `pythonw.exe` may sit
- * beside `python.exe` (a normal CPython install) or somewhere else entirely;
- * both are probed, and the same directory serves both roles.
- */
-const PYTHON_DIR = firstExisting(
-  [process.env.DSH_DANMAKU_PYTHON_DIR, 'C:/Python314'],
-  'C:/Python314',
-)
-const PYTHON = join(PYTHON_DIR, 'python.exe')
-const PYTHONW = join(PYTHON_DIR, 'pythonw.exe')
-
-const PWSH = join(
-  process.env.SystemRoot ?? 'C:/Windows',
-  'System32',
-  'WindowsPowerShell',
-  'v1.0',
-  'powershell.exe',
-)
-
-
-/** Events kept for a late-joining panel. A backfill, not a history. */
+/** 回填窗口。这是一份"补课"，不是历史：面板/浮层迟到时够看就行。 */
 const RECENT_LIMIT = 120
-/** How long a launch may take before it is reported as failed. */
-const STARTUP_SETTLE_MS = 8000
+/** 「上一轮说了什么」最多记住几个会话，免得 Map 跟着会话数无限长。 */
+const ANSWER_MEMORY = 32
 
 // --------------------------------------------------------------------------- //
-// Frame helpers
+// 前端脚本：读盘 + 注入页面
+// --------------------------------------------------------------------------- //
+
+let cachedFrontend = null
+
+/**
+ * 按 mtime 热读前端脚本。
+ *
+ * 常驻缓存过一次，结果是"改了前端但页面还是旧的"，而且看起来像没保存。mtime 比较很便宜，
+ * 换掉的是整类"改完不生效"的困惑。
+ */
+function loadFrontend() {
+  try {
+    const stat = statSync(FRONT_FILE)
+    if (cachedFrontend !== null && cachedFrontend.mtimeMs === stat.mtimeMs) return cachedFrontend.text
+    const text = readFileSync(FRONT_FILE, 'utf8')
+    cachedFrontend = { mtimeMs: stat.mtimeMs, size: stat.size, text }
+    return text
+  } catch (error) {
+    // 读不到就退回上一次的内容（总比给页面一段语法错误的空字符串好），并留下痕迹。
+    console.error('[dsh-danmaku] 读不到前端脚本：', String(error?.message ?? error))
+    return cachedFrontend === null ? '/* dsh-danmaku: frontend bundle missing */' : cachedFrontend.text
+  }
+}
+
+/**
+ * 桌面端（Electron）的注入行，**必须是一段内联 script**，不能是 `script-src` 行。
+ *
+ * 桌面壳的 index.html 从安装包静态 dist 直出，`tapIndex`（函数变换）永远不经过它，
+ * 唯一通道是 `webserver/index-inject` 推的结构化行；而页面侧解释器对两种 script 行的
+ * 处理是不对称的：`script` 行是 createElement + textContent，没有 await，不可能失败；
+ * `script-src` 行是 await loadScript(src)，**加载失败会 reject 掉 __DSH_BOOT_READY__，
+ * 整个应用起不来**（whale-widget 的 issue #154 就是这条）。
+ *
+ * 我们的路由在插件停用后就是 404，所以这里自己建标签、自己吞掉 onerror：
+ * 路由在就正常加载，路由不在就静默失败——宿主永远不会因为我们起不来。
+ *
+ * 另外，那张注入表是宿主**启动时一次性收集**的，所以这一行必须在 `apply()` 一开头注册，
+ * 不能等 service 就绪（等到了就赶不上收集了，症状是"桌面端弹幕从不出现"）。
+ */
+const INLINE_LOADER =
+  '(function(){try{var d=document.body||document.head||document.documentElement;if(!d)return;' +
+  `var s=document.createElement("script");s.src="${FRONT_URL}";` +
+  's.onerror=function(){};d.appendChild(s)}catch(e){}})()'
+
+// --------------------------------------------------------------------------- //
+// 帧辅助
 // --------------------------------------------------------------------------- //
 
 function sendJson(res, status, payload) {
@@ -110,9 +104,8 @@ function readBody(req) {
     let size = 0
     req.on('data', (chunk) => {
       size += chunk.length
-      // The only body this plugin accepts is a small JSON object. Anything
-      // larger is not a request it understands, so it is dropped rather than
-      // buffered.
+      // 这个插件接受的唯一 body 是一个小 JSON 对象。比这更大的不是给它的请求，
+      // 直接丢，不缓冲。
       if (size > 64 * 1024) {
         req.destroy()
         resolve(null)
@@ -136,552 +129,713 @@ function readBody(req) {
   })
 }
 
-function numberOrNull(pattern, text) {
-  const match = pattern.exec(text)
-  return match ? Number(match[1]) : null
-}
-
-function parseStatus(text) {
-  /* 'running pid=1 hwnd=2 bubbles=3 ingested=4 height=266 age=2.0s' */
-  const line = typeof text === 'string' ? text : ''
-  return {
-    running: false,
-    pid: numberOrNull(/pid=(\d+)/, line),
-    bubbles: numberOrNull(/bubbles=(\d+)/, line),
-    ingested: numberOrNull(/ingested=(\d+)/, line),
-    height: numberOrNull(/height=(\d+)/, line),
-    line,
-  }
-}
-
-function plain(state) {
-  /* Rebuilt field by field. `undefined` is not JSON, and a route that hands one
-     back produces a body the caller cannot distinguish from "no answer". */
-  return {
-    running: state.running === true,
-    unknown: state.unknown === true,
-    pid: state.pid === undefined ? null : state.pid,
-    bubbles: state.bubbles === undefined ? null : state.bubbles,
-    ingested: state.ingested === undefined ? null : state.ingested,
-    height: state.height === undefined ? null : state.height,
-    session: typeof state.session === 'string' ? state.session : '',
-    line: typeof state.line === 'string' ? state.line : '',
-    note: typeof state.note === 'string' ? state.note : '',
-  }
-}
-
-/* Single quotes for PowerShell arguments: inside them nothing is interpolated,
-   which matters because a session id and a URL both look like variables. An
-   embedded single quote is doubled, which is how PowerShell escapes one. */
-function psQuote(value) {
-  return "'" + String(value).replace(/'/g, "''") + "'"
-}
-
 // --------------------------------------------------------------------------- //
-// The plugin
+// 事件 → 一句话
+//
+// 这段是从原来那份 Python 面板里搬过来的（它当时负责把原始事件读成气泡上的句子）。
+// 搬到 host 的理由有两个：前端因此薄得只剩渲染；而且"同一件事该怎么说"只在一个地方决定，
+// DSH 页面里的那份和桌面 overlay 里的那份不可能说法不一样。
 // --------------------------------------------------------------------------- //
 
-export const name = 'danmaku-overlay'
-export const inject = ['subprocess', 'shell', 'timer', 'webServer', 'sessionController']
+const TOOL_VERBS = {
+  read: '正在读取',
+  read_image: '正在看图片',
+  write: '正在写入',
+  edit: '正在修改',
+  glob: '正在查找文件',
+  grep: '正在搜索',
+  pwsh: '正在执行命令',
+  bash: '正在执行命令',
+  web_search: '正在搜索网络',
+  web_fetch: '正在抓取网页',
+  todo_write: '正在更新任务清单',
+  ask_user_question: '正在向你提问',
+  skill: '正在加载技能',
+  task: '正在派发子任务',
+  subagent: '正在派发子代理',
+  subagent_fork: '正在派发子代理',
+  send_message: '正在给子代理发消息',
+  workflow: '正在编排工作流',
+  ralph: '正在跑 Ralph 循环',
+  present: '正在交付文件',
+  list_agents: '正在查看子代理',
+  interrupt_agent: '正在中断子代理',
+  cordis_define: '正在定义插件',
+  cordis_run: '正在运行插件',
+  cordis_stop: '正在停止插件',
+  cordis_undefine: '正在删除插件',
+  cordis_inspect_query: '正在查询接口',
+  cordis_inspect_self: '正在查看插件状态',
+  cordis_inspect_list: '正在列出接口',
+  mcp__unity__execute_code: '正在 Unity 里执行代码',
+  mcp__unity__batch_execute: '正在批量操作 Unity',
+  mcp__unity__manage_gameobject: '正在编辑 Unity 物体',
+  mcp__unity__manage_components: '正在编辑 Unity 组件',
+  mcp__unity__manage_scene: '正在操作 Unity 场景',
+  mcp__unity__manage_asset: '正在操作 Unity 资源',
+}
 
-export function apply(ctx) {
-  const listeners = new Set()
-  const recent = []
+/**
+ * 哪个参数会变成气泡的"对象"，按优先级排。
+ *
+ * `description` 故意排在 `command` 前面：一条 shell 调用两个都有，而它们读起来天差地别——
+ * description 是一句人话（"核对事件字段"），command 是整段脚本（换行、赋值、引号）。
+ * 把后者截断到气泡长度，会从半个 token 处切开，得到的是一屏噪音，信息量还不如那句描述。
+ * 完整的命令仍然留在详情里，那才是长内容该待的地方。
+ */
+const SUBJECT_KEYS = [
+  'description',
+  'objective',
+  'pattern',
+  'query',
+  'queries',
+  'file_path',
+  'path',
+  'url',
+  'search_term',
+  'menu_path',
+  'tool_name',
+  'command',
+  'name',
+  'packageId',
+  'pluginId',
+  'action',
+  'mode',
+  'reason',
+]
 
-  // -- the event stream the panel reads ------------------------------------- //
+/** 永远不当对象、也不值得报告的参数：文件正文与替换文本又大又不可读。 */
+const NOISE_KEYS = new Set(['content', 'new_string', 'old_string', 'oldText', 'newText'])
+const FILE_KEYS = new Set(['file_path', 'path'])
 
-  function publish(event) {
-    recent.push(event)
-    if (recent.length > RECENT_LIMIT) recent.splice(0, recent.length - RECENT_LIMIT)
-    const frame = `data: ${JSON.stringify(event)}\n\n`
-    for (const listener of listeners) {
-      try {
-        listener.write(frame)
-      } catch {
-        /* A dead socket is removed by its own close handler; dropping this
-           frame is correct and retrying it would be worse. */
+/** 详情里单个参数值的截断长度。 */
+const DETAIL_VALUE_LIMIT = 1600
+
+function verbFor(name) {
+  if (Object.hasOwn(TOOL_VERBS, name)) return TOOL_VERBS[name]
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__')
+    if (parts.length >= 3) return `正在 ${parts[1]} · ${parts[2]}`
+  }
+  return `正在调用 ${name}`
+}
+
+function shorten(value, limit = 90) {
+  const text = String(value ?? '')
+    .replace(/\r/g, ' ')
+    .replace(/\n/g, ' ')
+    .split(/\s+/)
+    .filter((part) => part !== '')
+    .join(' ')
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
+}
+
+function tailPath(path, keep = 2) {
+  const normalized = String(path).replace(/\\/g, '/')
+  const parts = normalized.split('/').filter((part) => part !== '')
+  return parts.length > keep ? parts.slice(-keep).join('/') : normalized
+}
+
+function subjectOf(args) {
+  if (args === null || args === undefined || typeof args !== 'object') return { subject: null, key: null }
+  for (const key of SUBJECT_KEYS) {
+    if (NOISE_KEYS.has(key)) continue
+    const value = args[key]
+    if (value === null || value === undefined || value === '' || value === 0) continue
+    if (Array.isArray(value)) {
+      if (value.length === 0) continue
+      const joined = value.filter((item) => item !== null && item !== undefined && item !== '').map(String).join(' / ')
+      if (joined === '') continue
+      return { subject: shorten(joined), key }
+    }
+    return { subject: shorten(value), key }
+  }
+  return { subject: null, key: null }
+}
+
+/** 一棵工具调用参数的完整文本，给详情面板。每个值都截断，一条巨型命令不至于毁掉可读性。 */
+function describeCall(args) {
+  if (args === null || args === undefined) return ''
+  if (typeof args !== 'object') return String(args).slice(0, DETAIL_VALUE_LIMIT)
+  const lines = []
+  for (const key of Object.keys(args)) {
+    const value = args[key]
+    if (value === null || value === undefined) continue
+    const rendered = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+    if (typeof rendered !== 'string' || rendered === '') continue
+    const clipped =
+      rendered.length > DETAIL_VALUE_LIMIT
+        ? `${rendered.slice(0, DETAIL_VALUE_LIMIT)}\n… （已截断，共 ${rendered.length} 字）`
+        : rendered
+    lines.push(`${key}:\n${clipped}`)
+  }
+  return lines.join('\n\n')
+}
+
+/** 这一轮没产生回复时，用一句话解释为什么。 */
+function turnEndDetail(reason) {
+  const wording = {
+    aborted: '这一轮被中止了，没有产生回复。',
+    interrupted: '这一轮被打断了，没有产生回复。',
+    error: '这一轮出错了，没有产生回复。',
+    blocked: '这一轮被阻止了，没有产生回复。',
+    'max-tokens': '输出达到上限，回复被截断了。',
+    completed: '这一轮结束了，但没有文本回复。',
+  }
+  return wording[reason] ?? `这一轮结束了（${reason}），没有产生回复。`
+}
+
+function turnEndSentence(reason) {
+  const wording = {
+    completed: '这一轮结束了',
+    aborted: '这一轮被中止',
+    error: '这一轮出错了',
+    interrupted: '这一轮被打断',
+    blocked: '这一轮被阻止',
+    'max-tokens': '输出达到上限',
+  }
+  return wording[reason] ?? `这一轮结束了（${reason}）`
+}
+
+/**
+ * 把一条原始事件读成 `{ kind, text, detail }`，读不出句子就返回 null。
+ *
+ * `text` 是气泡上那一行，`detail` 是点开之后看的全文。
+ */
+function interpret(event) {
+  const kind = String(event?.kind ?? '')
+
+  if (kind === 'tool:ok' || kind === 'tool:error') {
+    const name = String(event.tool ?? '') || 'tool'
+    const verb = verbFor(name)
+    const { subject, key } = subjectOf(event.args)
+    const shown = subject !== null && FILE_KEYS.has(key) ? tailPath(subject) : subject
+    const body = describeCall(event.args)
+    const head = `${name}\n\n${body === '' ? '（没有参数）' : body}`
+    if (kind === 'tool:error') {
+      return {
+        kind,
+        text: `${verb.replace('正在', '')}失败${shown === null ? '' : ` · ${shown}`}`,
+        detail: head,
       }
     }
+    return { kind, text: shown === null ? verb : `${verb} ${shown}`, detail: head }
   }
 
-  /* Read only the leaf fields the panel renders. The event payloads carry live
-     DSH objects, so nothing is copied wholesale and nothing is stringified.
-  
-     The field names come from ToolExecutionInput, which is NOT the vocabulary the
-     panel speaks: the execution object carries `name`, `arguments`, and an `agent`
-     whose `id` is the session. An earlier version read `toolName` / `args` /
-     `sessionId`, which silently produced bubbles with no tool and no subject -
-     the events arrived, so nothing looked broken. */
-  /*
-   * A tool's own arguments are the whole story of what it did, so they are built
-   * into readable text here for the detail window.
-   *
-   * The values are the execution's own arguments - plain JSON by the time they
-   * reach a tool - and each is clipped, so one enormous command cannot turn the
-   * payload into something unreadable. Losing the tail of a very long string is a
-   * far better outcome than a detail window nobody can scroll to the end of.
-   */
-  const DETAIL_VALUE_LIMIT = 1600
-
-  function describeCall(args) {
-    if (args === null || args === undefined) return ''
-    if (typeof args !== 'object') return String(args).slice(0, DETAIL_VALUE_LIMIT)
-    const lines = []
-    for (const key of Object.keys(args)) {
-      const value = args[key]
-      if (value === null || value === undefined) continue
-      const rendered = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
-      if (typeof rendered !== 'string' || rendered === '') continue
-      const clipped =
-        rendered.length > DETAIL_VALUE_LIMIT
-          ? `${rendered.slice(0, DETAIL_VALUE_LIMIT)}\n… （已截断，共 ${rendered.length} 字）`
-          : rendered
-      lines.push(`${key}:\n${clipped}`)
-    }
-    return lines.join('\n\n')
+  if (kind === 'turn:end') {
+    return { kind, text: turnEndSentence(String(event.reason ?? '')), detail: String(event.detail ?? '') }
   }
 
-  ctx.on('tools/result', (exec, result) => {
-    if (result === null || result === undefined) return
-    const failed = result.isError === true
-    const name = typeof exec?.name === 'string' ? exec.name : ''
-    const args = exec?.arguments !== undefined && exec.arguments !== null ? exec.arguments : undefined
-    const body = describeCall(args)
-    publish({
-      kind: failed ? 'tool:error' : 'tool:ok',
-      tool: name === '' ? undefined : name,
-      args,
-      // The bubble sentence names the tool and its subject; the detail is the full
-      // call, which is what someone clicking a tool bubble is asking for.
-      detail: body === '' ? `${name}（没有参数）` : `${name}\n\n${body}`,
-      session: typeof exec?.agent?.id === 'string' ? exec.agent.id : undefined,
+  if (kind === 'user') {
+    const text = String(event.text ?? '')
+    return { kind, text: `你说：${shorten(text, 260)}`, detail: text }
+  }
+
+  if (kind === 'assistant') {
+    const text = String(event.text ?? '')
+    return { kind, text: `我说：${shorten(text, 260)}`, detail: text }
+  }
+
+  if (kind === 'assistant:final') {
+    const text = String(event.text ?? '')
+    return { kind, text: `我说：${shorten(text, 260)}`, detail: text }
+  }
+
+  if (kind === 'session:switch') {
+    return { kind, text: String(event.text ?? ''), detail: '' }
+  }
+
+  return null
+}
+
+/** 会话名：有标题就用标题，没有就退回 id 前几位——两条路都不会让气泡空着。 */
+function sessionLabel(sessionId, title) {
+  if (typeof title === 'string' && title !== '') return shorten(title, 24)
+  if (sessionId === '') return '当前会话'
+  return `${sessionId.slice(0, 8)}…`
+}
+
+// --------------------------------------------------------------------------- //
+// 插件
+// --------------------------------------------------------------------------- //
+
+export default {
+  name: 'dsh-danmaku',
+
+  apply(root) {
+    /*
+     * ① 注入行**先注册**，而且不依赖任何 service。
+     *
+     * 桌面端的注入表是宿主启动时一次性收集的；把注册放进 `root.inject([...])` 里，
+     * 就等于"等服务就绪之后再进表"——服务晚一点，这一行就永远进不去，
+     * 而症状是"桌面端弹幕从不出现"，host 侧没有任何报错。
+     */
+    root.on('webserver/index-inject', (table) => {
+      try {
+        if (!Array.isArray(table)) return
+        for (const row of table) {
+          if (row === null || row === undefined) continue
+          if (row.kind === 'script-src' && row.src === FRONT_URL) return
+          if (row.kind === 'script' && typeof row.text === 'string' && row.text.includes(FRONT_URL)) return
+        }
+        table.push({ kind: 'script', placement: 'body', text: INLINE_LOADER })
+      } catch (error) {
+        console.error('[dsh-danmaku] 注入 index 失败：', String(error?.message ?? error))
+      }
     })
-  })
 
-  /*
-   * The session log feed. The payload lives under `event.data` - a SessionEvent is
-   * `{ type, seq, time, data }` - and an earlier version read `event.reason` and
-   * `event.text`, neither of which exists. Nothing threw: the events arrived, and
-   * every bubble they produced was empty.
-   *
-   * Only leaf fields are read, and message text is pulled out block by block. The
-   * message objects are live DSH values, so they are never copied or stringified
-   * wholesale.
-   */
-  function textOfMessage(message) {
-    const content = message?.content
-    if (!Array.isArray(content)) return ''
-    const parts = []
-    for (const block of content) {
-      if (block === null || block === undefined) continue
-      if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-    }
-    return parts.join('\n').trim()
-  }
+    /*
+     * ② 其余逻辑等 service 就绪。
+     *
+     * `timer` **必须列在这里**，不能指望"用到的时候再拿"。Cordis 的 context 是个 Proxy：
+     * 没在 inject 里声明过的服务，属性访问会当场抛 `cannot get property "timer" without inject`。
+     * 而这条抛错的位置很坏——它发生在 SSE 的响应头已经发出去之后，webServer 的处理是
+     * **直接销毁 socket**（外加一条落在我们读不到的地方的 logger.warn）。现场看到的现象是
+     * "事件流 open 之后一毫秒就断、前端无限重连"，跟 inject 一个字都不沾边。
+     * 这条是拿一个临时探针插件实测出来的，值得记在这里。
+     */
+    root.inject(['webServer', 'timer'], (ctx) => {
+      const listeners = new Set()
+      const recent = []
+      /** 会话 id -> 这一轮最后一段助手文本，用来判断「结束但没有回复」。 */
+      const lastAnswer = new Map()
+      /** 只在诊断里用：一共播出去多少条。 */
+      let published = 0
+      /** 诊断用：SSE handler 里最后一次抛出来的东西。 */
+      let lastStreamError = ''
+      /** 诊断用：SSE handler 走完了几次。 */
+      let streamOpens = 0
+      /** 现在跟着谁。空串 = 还没定（第一条带会话的事件来定）。 */
+      let activeSession = ''
+      /** 活跃会话的标题，只为把切换提示写得像人话。 */
+      let activeTitle = ''
 
-  /** The most recent assistant text, so a turn with no answer can say so. */
-  let lastAnswer = null
+      function rememberAnswer(sessionId, text) {
+        if (sessionId === '') return
+        lastAnswer.delete(sessionId)
+        lastAnswer.set(sessionId, text)
+        while (lastAnswer.size > ANSWER_MEMORY) {
+          const oldest = lastAnswer.keys().next()
+          if (oldest.done === true) break
+          lastAnswer.delete(oldest.value)
+        }
+      }
 
-  /** Why a turn ended without producing an answer. */
-  function turnEndDetail(reason) {
-    const wording = {
-      aborted: '这一轮被中止了，没有产生回复。',
-      interrupted: '这一轮被打断了，没有产生回复。',
-      error: '这一轮出错了，没有产生回复。',
-      blocked: '这一轮被阻止了，没有产生回复。',
-      'max-tokens': '输出达到上限，回复被截断了。',
-      completed: '这一轮结束了，但没有文本回复。',
-    }
-    return wording[reason] ?? `这一轮结束了（${reason}），没有产生回复。`
-  }
+      function takeAnswer(sessionId) {
+        const value = lastAnswer.get(sessionId) ?? null
+        lastAnswer.delete(sessionId)
+        return value
+      }
 
-  ctx.on('session/event', (session, event) => {
-    if (event === null || event === undefined) return
-    const sessionId = typeof session?.id === 'string' ? session.id : undefined
-    const data = event.data
-    if (data === null || data === undefined) return
-
-    if (event.type === 'turn/end') {
-      // The reason is a discriminated union, not a string: { kind: 'completed' }.
-      const kind = data.reason?.kind
-      const reason = typeof kind === 'string' ? kind : ''
-      /*
-       * A NORMAL ending publishes nothing.
+      /**
+       * 这条事件来自"用户正在看的会话"吗？
        *
-       * "这一轮结束了" says nothing the answer bubble has not already said, and it
-       * was actively harmful: it carried no text, so clicking it opened a detail
-       * window whose entire body was that label. A reader who wants to know what
-       * was said gained a bubble that answered nothing and pushed the answer up.
+       * 子代理的会话也是一个 Session，它的工具调用会带着自己的 session id 到达。
+       * 不过滤的话，主会话派出去一个子代理，弹幕整片就跟着子代理走了——用户看的是主会话，
+       * 屏幕上的内容却换成了别人家的活。所以只播 root 会话。
        *
-       * The exception is an ending that produced no answer at all. If the last
-       * assistant message had no text - an abort, an error, an interruption - then
-       * the turn-end bubble is the only thing that explains the silence, so it is
-       * published with the explanation as its detail.
+       * 服务不在、或者列表为空时不拦（宁可多显示，也不要因为拿不到列表就整片哑掉）。
        */
-      if (reason !== 'completed' || lastAnswer === null) {
-        publish({
-          kind: 'turn:end',
-          reason,
-          detail: lastAnswer === null ? turnEndDetail(reason) : lastAnswer,
+      function isRootSession(sessionId) {
+        try {
+          const agents = ctx.get('agents')
+          if (agents === undefined || agents === null || typeof agents.roots !== 'function') return true
+          const roots = agents.roots()
+          if (!Array.isArray(roots) || roots.length === 0) return true
+          return roots.some((agent) => agent !== null && agent !== undefined && agent.id === sessionId)
+        } catch {
+          return true
+        }
+      }
+
+      function broadcast(event) {
+        const frame = `data: ${JSON.stringify(event)}\n\n`
+        for (const listener of listeners) {
+          try {
+            listener.write(frame)
+          } catch {
+            /*
+             * 写不进去的 socket 就地摘掉。
+             *
+             * 只靠 close 事件是不够的：断掉的连接如果没能触发 close，它会一直留在表里，
+             * 于是每来一条事件都往一个死 socket 上写、每 20 秒给它发一次心跳，
+             * 而 `clients` 这个数字会一直涨——看起来像"有八个客户端连着"，其实全是尸体。
+             */
+            listeners.delete(listener)
+          }
+        }
+      }
+
+      function push(event) {
+        published += 1
+        recent.push(event)
+        if (recent.length > RECENT_LIMIT) recent.splice(0, recent.length - RECENT_LIMIT)
+        broadcast(event)
+      }
+
+      /**
+       * 播一条事件，并维护"现在是哪个会话"。
+       *
+       * 规则只有三条，但要紧的是第一条：**用户消息是锚**。用户在自己看的那个会话里发话，
+       * 就等于告诉我们他在看谁；其余事件（工具、助手文本）只跟着锚走，不抢。
+       * 没有锚的时候（刚启动、或者这一轮还没有用户消息）就用第一条带会话的事件落位。
+       */
+      function publish(event) {
+        const sessionId = typeof event.session === 'string' ? event.session : ''
+        const title = typeof event.sessionTitle === 'string' ? event.sessionTitle : ''
+
+        if (sessionId !== '') {
+          if (!isRootSession(sessionId)) return
+          if (event.anchor === true) {
+            if (activeSession !== sessionId) {
+              activeSession = sessionId
+              activeTitle = title
+              push({
+                kind: 'session:switch',
+                text: `跟着你切到 ${sessionLabel(sessionId, title)}`,
+                detail: '',
+                session: sessionId,
+                sessionTitle: title,
+                at: Date.now(),
+              })
+            } else if (title !== '') {
+              activeTitle = title
+            }
+          } else if (activeSession === '') {
+            activeSession = sessionId
+            activeTitle = title
+          } else if (activeSession !== sessionId) {
+            return
+          } else if (title !== '') {
+            activeTitle = title
+          }
+        }
+
+        const spoken = interpret(event)
+        if (spoken === null) return
+        push({
+          kind: spoken.kind,
+          text: spoken.text,
+          detail: spoken.detail,
           session: sessionId,
+          sessionTitle: sessionId === activeSession ? activeTitle : title,
+          tool: typeof event.tool === 'string' ? event.tool : '',
+          reason: typeof event.reason === 'string' ? event.reason : '',
+          at: Date.now(),
         })
       }
-      lastAnswer = null
-      return
-    }
 
-    if (event.type === 'user/message') {
-      const text = textOfMessage(data)
-      if (text !== '') publish({ kind: 'user', text, detail: text, session: sessionId })
-      return
-    }
+      // -- 事件源 -------------------------------------------------------------- //
 
-    if (event.type === 'assistant/message') {
-      const message = data.message
-      const text = textOfMessage(message)
-      if (text === '') return
       /*
-       * A message that asks for tools is a step on the way; one that does not is
-       * the answer. `content` carries the tool-call blocks, so that is what
-       * distinguishes them - and the reply is the one worth clicking, because it
-       * is the long one.
+       * 字段名来自 ToolExecutionInput，**不是**面板那套词汇：执行对象带的是 `name`、
+       * `arguments`，以及一个 `agent`，会话就在它的 `id` 上。早先的版本读的是
+       * `toolName` / `args` / `sessionId`，不报错——事件照常到达，只是每颗气泡既没有工具名
+       * 也没有对象，看起来"没坏"，内容却是空的。
        */
-      const wantsTools = Array.isArray(message?.content)
-        ? message.content.some((block) => block?.type === 'tool-call')
-        : false
-      lastAnswer = text
-      publish({
-        kind: wantsTools ? 'assistant' : 'assistant:final',
-        text,
-        detail: text,
-        session: sessionId,
+      ctx.on('tools/result', (exec, result) => {
+        if (result === null || result === undefined) return
+        publish({
+          kind: result.isError === true ? 'tool:error' : 'tool:ok',
+          tool: typeof exec?.name === 'string' ? exec.name : '',
+          args: exec?.arguments === undefined ? null : exec.arguments,
+          session: typeof exec?.agent?.id === 'string' ? exec.agent.id : '',
+          sessionTitle: typeof exec?.agent?.title === 'string' ? exec.agent.title : '',
+        })
       })
-    }
-  })
 
-  /*
-   * Send one prompt to a session, the same way the DSH page does: through
-   * `sessionController.prompt`, which is the Host service behind the generated
-   * `ctx.remote.session` namespace.
-   *
-   * Read from the Service contract rather than guessed. The request is
-   * `{ requestId, sessionId, mode, content }`, where content is an array of
-   * `PromptContentPart`, and the answer is `{ accepted: true }`. `mode: 'queue'` is
-   * the ordinary case - a message typed while the agent is mid-turn waits its turn
-   * instead of interrupting - and `steer` is available for when interrupting is
-   * what is wanted.
-   */
-  function newRequestId() {
-    // Only needs to be unique among this session's in-flight requests, and
-    // `Math.random` is enough for that; a uuid would be a dependency for nothing.
-    return `dnk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-  }
-
-  async function sendPrompt(sessionId, text, mode) {
-    const controller = ctx.sessionController
-    if (controller === undefined) {
-      return { ok: false, error: 'this deployment has no session controller' }
-    }
-    /*
-     * The signal is NOT optional. The signature is `prompt(request, signal)`, and
-     * leaving it out fails inside the service with "Cannot read properties of
-     * undefined (reading 'throwIfAborted')" - a message that names nothing useful,
-     * which is why the argument list is worth reading instead of assuming a
-     * trailing parameter can be skipped.
-     *
-     * Aborted after a bounded wait: admission is quick, and a prompt not admitted
-     * by then is not going to be. The timer comes from the injected service, since
-     * a bare setTimeout is not available in a dynamic package - and `timer` was
-     * already declared.
-     */
-    const abort = new AbortController()
-    const stop = ctx.timeout(() => abort.abort(), 20000)
-    try {
-      const result = await controller.prompt(
-        {
-          requestId: newRequestId(),
-          sessionId,
-          mode: mode === 'steer' ? 'steer' : 'queue',
-          content: [{ type: 'text', text }],
-        },
-        abort.signal,
-      )
-      return { ok: result?.accepted === true, error: '' }
-    } catch (error) {
-      const message = error?.message ?? String(error)
-      return { ok: false, error: message.slice(0, 300) }
-    } finally {
-      stop()
-    }
-  }
-
-  // -- talking to the panel process ----------------------------------------- //
-
-  async function runShell(command, timeoutMs) {
-    const spec = ctx.shell.resolve({ command, workdir: PANEL_DIR, timeoutMs })
-    /* `execute` hands back a live handle, not a finished result - the result
-       projection is a second await. An older DSH exposed this as one `run(spec)`
-       call that returned the result directly, and that method is gone. */
-    const handle = await ctx.shell.execute(spec)
-    const result = await handle.result()
-    const stdout = result?.stdout?.text
-    const stderr = result?.stderr?.text
-    return {
-      code: result?.exitCode === null || result?.exitCode === undefined ? null : Number(result.exitCode),
-      text: typeof stdout === 'string' ? stdout.trim() : '',
-      err: typeof stderr === 'string' ? stderr.trim() : '',
-    }
-  }
-
-  async function readStatusFile() {
-    const fs = ctx.get('fs')
-    if (fs === undefined) return null
-    try {
-      const target = await fs.resolve(`${PANEL_DIR}/.panel-status.json`)
-      const parsed = JSON.parse(await fs.readText(target))
-      if (parsed === null || typeof parsed !== 'object') return null
-      return {
-        session: typeof parsed.session === 'string' ? parsed.session : '',
-        bubbles: typeof parsed.bubbles === 'number' ? parsed.bubbles : null,
-        ingested: typeof parsed.ingested === 'number' ? parsed.ingested : null,
-        height: parsed.settings && typeof parsed.settings.height === 'number' ? parsed.settings.height : null,
+      /*
+       * 会话日志feed。载荷在 `event.data` 里——SessionEvent 的形状是 `{ type, seq, time, data }`
+       * ——早先的版本读的是 `event.reason` 和 `event.text`，两个都不存在。什么都没抛：
+       * 事件到了，而它们产生的每一颗气泡都是空的。
+       *
+       * 只读叶子字段，消息文本逐块取。消息对象是活的 DSH 值，不整体复制、不整体序列化。
+       */
+      function textOfMessage(message) {
+        const content = message?.content
+        if (!Array.isArray(content)) return ''
+        const parts = []
+        for (const block of content) {
+          if (block === null || block === undefined) continue
+          if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+        }
+        return parts.join('\n').trim()
       }
-    } catch {
-      /* Absent, unreadable, or caught mid-rewrite. The exit code still answers
-         the only question that matters, so this is not an error. */
-      return null
-    }
-  }
 
-  /*
-   * Probe with python.exe, launch with pythonw.exe.
-   *
-   * pythonw.exe is a GUI-subsystem binary, and such a program has no console:
-   * given a pipe on stdout, Windows discards the output instead of connecting
-   * it. Measured three times in a row - pythonw returned exit code 0 and an
-   * empty string for the same `--status` call that python answered in full. So
-   * the probe lost its answer and the button read "closed" for a panel that was
-   * running. The launch keeps pythonw so no console window flashes behind the
-   * overlay.
-   */
-  async function probe() {
-    let result
-    try {
-      result = await runShell(`${PYTHON} ${psQuote(PANEL_SCRIPT)} --status`, 15000)
-    } catch (error) {
-      return plain({ running: false, unknown: true, note: String(error?.message ?? error) })
-    }
-    const parsed = parseStatus(result.text)
-    // The exit code is the authority; the text only adds detail.
-    // 0 running, 1 stopped, 2 never started.
-    parsed.running = result.code === 0
-    parsed.unknown = result.code === 2
-    if (result.text === '' && result.err !== '') parsed.note = result.err.slice(0, 160)
-    const detail = await readStatusFile()
-    if (detail !== null) {
-      parsed.session = detail.session
-      if (detail.bubbles !== null) parsed.bubbles = detail.bubbles
-      if (detail.ingested !== null) parsed.ingested = detail.ingested
-      if (detail.height !== null) parsed.height = detail.height
-    }
-    return plain(parsed)
-  }
+      ctx.on('session/event', (session, event) => {
+        if (event === null || event === undefined) return
+        const sessionId = typeof session?.id === 'string' ? session.id : ''
+        const sessionTitle = typeof session?.title === 'string' ? session.title : ''
+        const data = event.data
+        if (data === null || data === undefined) return
 
-  /*
-   * The launch uses subprocess.spawn, and that is not a style choice.
-   *
-   * `ctx.shell` reaps the shell's whole process tree when a command completes,
-   * so a panel started that way is dead within seconds - and quietly, because it
-   * had already written its startup log line first. It reads exactly like a
-   * crash on startup. Measured by launching the identical command both ways:
-   * through ctx.shell the process was gone every time, through a shell of my own
-   * it was still alive ten seconds later.
-   */
-  function startPanel(sessionId) {
-    const webServer = ctx.get('webServer')
-    const baseUrl = webServer !== undefined && typeof webServer.port === 'number'
-      ? `http://127.0.0.1:${String(webServer.port)}`
-      : ''
-    if (baseUrl === '') return { ok: false, reason: 'no web server in this scope' }
-    try {
-      ctx.subprocess.spawn({
-        argv: [PYTHONW, PANEL_SCRIPT, '--session', sessionId, '--url', baseUrl],
-        cwd: PANEL_DIR,
-        stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
-        graceMs: 5000,
-      })
-      return { ok: true, baseUrl }
-    } catch (error) {
-      return { ok: false, reason: `spawn threw: ${String(error?.message ?? error)}` }
-    }
-  }
-
-  /*
-   * Stopping matches the process by its command line rather than going through a
-   * recorded child handle. The handle belongs to this process, so it is lost
-   * with it, and a handle-based stop would leak the very window it was meant to
-   * close. It is also the same rule the escape-hatch script follows, which keeps
-   * one behaviour in one place.
-   */
-  async function stopPanel() {
-    const command = `${PWSH} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${psQuote(STOP_SCRIPT)}`
-    return await runShell(command, 15000)
-  }
-
-  function sleep(ms) {
-    return new Promise((resolve) => ctx.timeout(resolve, ms))
-  }
-
-  // -- routes ---------------------------------------------------------------- //
-
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: '/dsh-danmaku/v3/status',
-        handler: async (req, res) => {
-          sendJson(res, 200, await probe())
-        },
-      }),
-    'danmaku:route:status',
-  )
-
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: '/dsh-danmaku/v3/send',
-        handler: async (req, res) => {
-          if (req.method !== 'POST') {
-            sendJson(res, 405, { ok: false, error: 'POST only' })
-            return
-          }
-          const body = await readBody(req)
-          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
-          const text = typeof body?.text === 'string' ? body.text.trim() : ''
-          if (sessionId === '') {
-            sendJson(res, 400, { ok: false, error: 'no session id' })
-            return
-          }
-          if (text === '') {
-            sendJson(res, 400, { ok: false, error: 'nothing to send' })
-            return
-          }
-          const outcome = await sendPrompt(sessionId, text, body?.mode)
-          sendJson(res, 200, outcome)
-        },
-      }),
-    'danmaku:route:send',
-  )
-
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: '/dsh-danmaku/v3/toggle',
-        handler: async (req, res) => {
-          if (req.method !== 'POST') {
-            sendJson(res, 405, { error: 'POST only' })
-            return
-          }
-          const body = await readBody(req)
-          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
-          if (sessionId === '') {
-            sendJson(res, 400, { running: false, stopped: false, error: 'no session id' })
-            return
-          }
-
-          // Ask first. Acting on an assumption is how a second overlay ends up
-          // stacked on top of the first one.
-          const before = await probe()
-          if (before.running === true) {
-            const stopped = await stopPanel()
-            const after = await probe()
-            if (after.running === true) {
-              sendJson(res, 200, {
-                running: true,
-                stopped: false,
-                error: `stop did not take effect: ${(stopped.text || stopped.err).slice(0, 120)}`,
-              })
-              return
-            }
-            sendJson(res, 200, { running: false, stopped: true, error: '', line: stopped.text })
-            return
-          }
-
-          const result = startPanel(sessionId)
-          if (result.ok !== true) {
-            sendJson(res, 200, { running: false, stopped: false, error: result.reason })
-            return
-          }
-          // The launch is detached, so its outcome is only knowable by asking the
-          // panel afterwards. Wait long enough for it to have painted once.
-          await sleep(STARTUP_SETTLE_MS)
-          const after = await probe()
-          if (after.running !== true) {
-            sendJson(res, 200, {
-              running: false,
-              stopped: false,
-              error: 'launched but no panel reported itself; see .panel-startup.log',
+        if (event.type === 'turn/end') {
+          // reason 是一个判别联合，不是字符串：{ kind: 'completed' }。
+          const kind = data.reason?.kind
+          const reason = typeof kind === 'string' ? kind : ''
+          /*
+           * 正常结束**什么都不播**。
+           *
+           * 「这一轮结束了」没有说出回复气泡没说过的任何事，而且它是有害的：它不带文本，
+           * 点开之后详情里只有这句标签。想看"说了什么"的人，得到的是一颗什么都没回答、
+           * 还把回复顶上去了的气泡。
+           *
+           * 例外是「这一轮压根没有回复」。如果最后一条助手消息没有文本——中止、报错、
+           * 被打断——那这颗 turn:end 就是唯一解释沉默的东西，于是连解释一起播。
+           */
+          const answer = takeAnswer(sessionId)
+          if (reason !== 'completed' || answer === null) {
+            publish({
+              kind: 'turn:end',
+              reason,
+              detail: answer === null ? turnEndDetail(reason) : answer,
+              session: sessionId,
+              sessionTitle,
             })
-            return
           }
-          sendJson(res, 200, { running: true, stopped: false, error: '', line: after.line })
-        },
-      }),
-    'danmaku:route:toggle',
-  )
+          return
+        }
 
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: '/dsh-danmaku/v3/recent',
-        handler: (req, res) => {
-          sendJson(res, 200, recent)
-        },
-      }),
-    'danmaku:route:recent',
-  )
+        if (event.type === 'user/message') {
+          const text = textOfMessage(data)
+          if (text === '') return
+          // anchor：用户自己发的话，指认了他正在看的那个会话。
+          publish({ kind: 'user', text, session: sessionId, sessionTitle, anchor: true })
+          return
+        }
 
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: '/dsh-danmaku/v3/stream',
-        handler: (req, res) => {
-          res.writeHead(200, {
-            'content-type': 'text/event-stream; charset=utf-8',
-            'cache-control': 'no-cache, no-transform',
-            connection: 'keep-alive',
-            'x-accel-buffering': 'no',
+        if (event.type === 'assistant/message') {
+          const message = data.message
+          const text = textOfMessage(message)
+          if (text === '') return
+          /*
+           * 带工具调用的消息是路上的一步，不带的才是回答。`content` 里就有工具调用块，
+           * 用它区分——值得点开的是那句回答，因为它是长的那个。
+           */
+          const wantsTools = Array.isArray(message?.content)
+            ? message.content.some((block) => block?.type === 'tool-call')
+            : false
+          rememberAnswer(sessionId, text)
+          publish({
+            kind: wantsTools ? 'assistant' : 'assistant:final',
+            text,
+            session: sessionId,
+            sessionTitle,
           })
-          // A comment frame makes the browser and urllib both treat the stream as
-          // open immediately, instead of waiting for the first event.
-          res.write(': connected\n\n')
-          listeners.add(res)
+        }
+      })
 
-          // A keepalive, so a proxy does not close an idle stream and the panel's
-          // read loop does not sit in a blocking read forever.
-          const beat = ctx.interval(() => {
-            try {
-              res.write(': ping\n\n')
-            } catch {
-              /* Removed by the close handler below. */
-            }
-          }, 20000)
+      // -- 发消息 -------------------------------------------------------------- //
 
-          const close = () => {
-            beat()
-            listeners.delete(res)
-          }
-          req.on('close', close)
-          res.on('close', close)
-          res.on('error', close)
-        },
-      }),
-    'danmaku:route:stream',
-  )
+      /*
+       * 往会话里送一句话，方式和 DSH 页面一样：走 `sessionController.prompt`，
+       * 也就是生成的 `ctx.remote.session` 命名空间背后的那个 Host service。
+       *
+       * 请求形状读的是 Service 契约而不是猜的：`{ requestId, sessionId, mode, content }`，
+       * content 是一组 `PromptContentPart`，回执是 `{ accepted: true }`。
+       * `mode: 'queue'` 是常规情况——agent 正在一轮里时，打进去的话排队等它，
+       * 而不是打断；想打断就用 `steer`。
+       *
+       * **signal 不是可选的**：签名是 `prompt(request, signal)`，不给会在 service 内部炸成
+       * "Cannot read properties of undefined (reading 'throwIfAborted')"——一句不指向任何
+       * 有用东西的错误。所以这里给一个带超时的 signal（准入很快，超时还没进来就是进不来了）。
+       */
+      function newRequestId() {
+        // 只需要在这一个会话的在途请求里唯一，`Math.random` 够了；引一个 uuid 是为零件事加一个依赖。
+        return `dnk-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+      }
 
-  console.log('danmaku overlay plugin ready')
+      async function sendPrompt(sessionId, text, mode) {
+        const controller = ctx.get('sessionController')
+        if (controller === undefined || controller === null) {
+          return { ok: false, error: 'this deployment has no session controller' }
+        }
+        try {
+          const result = await controller.prompt(
+            {
+              requestId: newRequestId(),
+              sessionId,
+              mode: mode === 'steer' ? 'steer' : 'queue',
+              content: [{ type: 'text', text }],
+            },
+            AbortSignal.timeout(20000),
+          )
+          return { ok: result?.accepted === true, error: '' }
+        } catch (error) {
+          return { ok: false, error: String(error?.message ?? error).slice(0, 300) }
+        }
+      }
+
+      // -- 路由 ---------------------------------------------------------------- //
+
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: FRONT_URL,
+            handler: (req, res) => {
+              const text = loadFrontend()
+              const body = Buffer.from(text, 'utf8')
+              res.writeHead(200, {
+                'content-type': 'application/javascript; charset=utf-8',
+                'content-length': String(body.length),
+                'cache-control': 'no-store',
+              })
+              res.end(body)
+            },
+          }),
+        'dsh-danmaku:route:frontend',
+      )
+
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/status`,
+            handler: (req, res) => {
+              const stat = (() => {
+                try {
+                  return statSync(FRONT_FILE)
+                } catch {
+                  return null
+                }
+              })()
+              sendJson(res, 200, {
+                ok: true,
+                build: 'v2',
+                active: activeSession,
+                activeTitle,
+                sessions: lastAnswer.size,
+                events: published,
+                recent: recent.length,
+                clients: listeners.size,
+                streamOpens,
+                lastStreamError,
+                frontend: {
+                  url: FRONT_URL,
+                  bytes: stat === null ? null : stat.size,
+                  mtime: stat === null ? null : stat.mtimeMs,
+                },
+              })
+            },
+          }),
+        'dsh-danmaku:route:status',
+      )
+
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/recent`,
+            handler: (req, res) => {
+              /*
+               * 回填带上「现在是哪个会话」。
+               *
+               * 前端迟到（刷新、overlay 重新露面）时，它能拿到的只有这份 JSON；只给一串事件的话，
+               * 它没有依据判断哪些还该显示——跟随会话这件事是在 host 这边决定的，所以答案也得从
+               * 这边给出去。
+               */
+              sendJson(res, 200, { active: activeSession, activeTitle, events: recent })
+            },
+          }),
+        'dsh-danmaku:route:recent',
+      )
+
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/send`,
+            handler: async (req, res) => {
+              if (req.method !== 'POST') {
+                sendJson(res, 405, { ok: false, error: 'POST only' })
+                return
+              }
+              const body = await readBody(req)
+              const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : ''
+              const text = typeof body?.text === 'string' ? body.text.trim() : ''
+              if (sessionId === '') {
+                sendJson(res, 400, { ok: false, error: '没有会话 id' })
+                return
+              }
+              if (text === '') {
+                sendJson(res, 400, { ok: false, error: '没写内容' })
+                return
+              }
+              sendJson(res, 200, await sendPrompt(sessionId, text, body?.mode))
+            },
+          }),
+        'dsh-danmaku:route:send',
+      )
+
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/stream`,
+            handler: (req, res) => {
+              streamOpens += 1
+              /*
+               * 整段包起来，只为把错误留下痕迹。
+               *
+               * webServer 的规矩是：handler 抛错就回 400，而响应头已经发出去时**直接销毁
+               * socket**，外加一条 logger.warn。桌面端的 logger 没有落到任何我们能读的文件里，
+               * 所以"客户端 open 之后 1 毫秒就断"这件事在现场是没有解释的——只能靠自己在
+               * status 里留一份。
+               */
+              try {
+                res.writeHead(200, {
+                  'content-type': 'text/event-stream; charset=utf-8',
+                  'cache-control': 'no-cache, no-transform',
+                  connection: 'keep-alive',
+                  'x-accel-buffering': 'no',
+                })
+                // 一帧注释让浏览器和 urllib 都立刻认为这条流是开着的，而不是等第一个事件。
+                res.write(': connected\n\n')
+              } catch (error) {
+                lastStreamError = `headers: ${String(error?.stack ?? error)}`
+                throw error
+              }
+
+              const ping = () => {
+                try {
+                  res.write(': ping\n\n')
+                } catch {
+                  /* 由下面的 close 处理器摘掉。 */
+                }
+              }
+
+              /*
+               * 顺序是有讲究的：**先把 close 处理器挂上，最后才把 res 放进 listeners**。
+               *
+               * 反过来的话，中间任何一步抛错都会留下一条永远摘不掉的连接 —— close 处理器还没
+               * 注册，而它已经在表里了。现场的表现就是 `clients` 一路涨到两位数，全是尸体，
+               * 每来一条事件都往它们身上写一次。（timer 那个 bug 正是这样留下了 11 条。）
+               */
+              let stopBeat = () => {}
+              const close = () => {
+                stopBeat()
+                listeners.delete(res)
+              }
+              try {
+                req.on('close', close)
+                res.on('close', close)
+                res.on('error', close)
+              } catch (error) {
+                lastStreamError = `close hooks: ${String(error?.stack ?? error)}`
+                throw error
+              }
+
+              // keepalive：让中间的代理不关掉空闲的流。`timer` 在 inject 里，所以这一行不会抛。
+              stopBeat = ctx.interval(ping, 20000)
+
+              listeners.add(res)
+            },
+          }),
+        'dsh-danmaku:route:stream',
+      )
+
+      console.log(`dsh-danmaku ready · frontend ${FRONT_URL}`)
+    })
+  },
 }

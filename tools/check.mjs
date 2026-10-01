@@ -1,0 +1,591 @@
+/**
+ * dsh-danmaku —— 离线自检
+ *
+ * 为什么值得写：这套东西的两个半边，失败的样子都是**安静的**。
+ *
+ *   - host 半边把事件读错字段名（例如 `toolName` 而不是 `name`），什么都不抛：事件照常到达，
+ *     只是每颗气泡既没有工具名也没有对象。看起来"没坏"，内容却是空的。
+ *   - 前端挂在两个地方，而两边都没有方便的控制台：DSH 页面里它只是"没出现"，overlay 页面里
+ *     更是没人会去开 devtools。等真机上发现"什么都没有"再回头查，一轮一轮都很贵。
+ *
+ * 所以这里用一套最小 DOM 在 Node 里把前端真跑一遍，再用一个假 root/假 ctx 把 host 半边
+ * 真跑一遍。它不能替代真机验证，但能在按 F5 之前把"字段读错、路由没注册、脚本一跑就抛异常"
+ * 这一类错误全部挡下来。
+ *
+ * 跑法：node tools/check.mjs
+ */
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createContext, runInContext } from 'node:vm'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const ROOT = join(HERE, '..')
+const FRONT_FILE = join(ROOT, 'plugin', 'lib', 'bubbles.js')
+const HOST_FILE = join(ROOT, 'plugin', 'lib', 'index.js')
+
+const ROOT_ID = 'dsh-danmaku-root'
+const FRONT_URL = '/dsh-danmaku/v3/bubbles.js'
+
+let passed = 0
+function ok(label) {
+  passed += 1
+  console.log(`  \u2713 ${label}`)
+}
+
+// --------------------------------------------------------------------------- //
+// 第一段：host 半边
+// --------------------------------------------------------------------------- //
+
+function fakeResponse() {
+  const state = { status: 0, headers: {}, body: '', frames: [] }
+  return {
+    state,
+    writeHead(status, headers) {
+      state.status = status
+      Object.assign(state.headers, headers ?? {})
+    },
+    write(chunk) {
+      state.frames.push(String(chunk))
+    },
+    on() {
+      /* SSE 路由给 res 挂了 close / error；假对象不需要真的触发它们。 */
+    },
+    end(chunk) {
+      if (chunk !== undefined) state.body += String(chunk)
+    },
+  }
+}
+
+function fakeRequest(method = 'GET') {
+  return { method, on() {} }
+}
+
+/** 一个能喂 body 的假 POST 请求：`readBody` 先挂 `data` 再挂 `end`。 */
+function fakePostRequest(payload) {
+  const listeners = new Map()
+  return {
+    method: 'POST',
+    on(event, listener) {
+      if (!listeners.has(event)) listeners.set(event, [])
+      listeners.get(event).push(listener)
+      if (event === 'data') listener(Buffer.from(JSON.stringify(payload), 'utf8'))
+      if (event === 'end') setImmediate(() => listener())
+    },
+  }
+}
+
+async function checkHost() {
+  const module = await import(new URL('../plugin/lib/index.js', import.meta.url).href)
+  const plugin = module.default
+
+  assert.equal(plugin.name, 'dsh-danmaku', 'host 半边的 name 不对')
+  assert.equal(typeof plugin.apply, 'function', 'host 半边没有 apply')
+  /*
+   * 这条是硬的：**对象级 inject 绝不能有**。
+   *
+   * 它会把整个 apply 推迟到 webServer 就绪之后，而桌面端的 index 注入表是宿主启动时
+   * 一次性收集的 —— 晚了就永远进不去，症状是"桌面端弹幕从不出现"，host 侧没有任何报错。
+   * 正确的形状是 apply 立刻执行、第一件事注册注入行，其余逻辑放进 root.inject([...])。
+   */
+  assert.equal(plugin.inject, undefined, '出现了对象级 inject：桌面端的注入行会赶不上收集')
+  ok('host 导出形状（default 对象 / 无对象级 inject）')
+
+  const handlers = new Map()
+  const routes = new Map()
+  /** 插件声明过的服务，由 root.inject 填。 */
+  const declared = []
+
+  /*
+   * 复刻 Cordis 的 inject 门禁。
+   *
+   * 这不是"多写一层保险"——它是真实踩过的坑：`ctx.interval` 来自 `timer` 服务，而 timer
+   * 不在 inject 里时，属性访问会抛 `cannot get property "timer" without inject`。抛错的位置
+   * 在 SSE 响应头已经发出去之后，webServer 会把 socket 直接销毁，现象是"事件流一毫秒就断"。
+   * 假 ctx 不模拟这道门禁的话，这类错误只有在真机上才会现形，而真机上 host 代码每改一次都要
+   * 重启客户端才能重载。
+   */
+  const services = {
+    /*
+     * 三个 root 会话：a 先落位、b 是用户切过去的、c 用来验证"别的会话在说话"不会抢走 active。
+     * 子代理会话不在这里面（`isRootSession` 会把它们挡住，另有一条断言）。
+     */
+    agents: { roots: () => [{ id: 'session-a' }, { id: 'session-b' }, { id: 'session-c' }] },
+    sessionController: {
+      async prompt() {
+        return { accepted: true }
+      },
+    },
+    timer: {
+      interval() {
+        return () => {}
+      },
+    },
+    webServer: {
+      port: 19387,
+      register(route) {
+        routes.set(route.path, route)
+        return () => routes.delete(route.path)
+      },
+    },
+  }
+
+  /** 直接挂在 context 上的方法来自哪个服务（Cordis 把它叫 mixin）。 */
+  const MIXINS = { interval: 'timer', timeout: 'timer', throttle: 'timer', debounce: 'timer' }
+
+  const base = {
+    on(name, listener) {
+      handlers.set(name, listener)
+    },
+    effect(factory) {
+      return factory()
+    },
+    /* `ctx.get()` 是宽松读取：拿不到就是 undefined，不受 inject 门禁约束。 */
+    get(name) {
+      return services[name]
+    },
+  }
+
+  const ctx = new Proxy(base, {
+    get(target, prop) {
+      if (prop === 'then') return undefined
+      if (Reflect.has(target, prop)) return target[prop]
+      const owner = MIXINS[prop]
+      if (owner !== undefined) {
+        if (!declared.includes(owner)) throw new Error(`cannot get property "${owner}" without inject`)
+        return services[owner][prop]
+      }
+      if (Object.hasOwn(services, prop)) {
+        if (!declared.includes(prop)) throw new Error(`cannot get property "${prop}" without inject`)
+        return services[prop]
+      }
+      return undefined
+    },
+  })
+
+  const root = {
+    on(name, listener) {
+      handlers.set(name, listener)
+    },
+    inject(names, callback) {
+      declared.length = 0
+      declared.push(...names)
+      callback(ctx)
+    },
+  }
+
+  plugin.apply(root)
+  assert.ok(declared.includes('timer'), 'timer 没进 inject：ctx.interval 会抛 cannot get property "timer" without inject')
+  ok('apply 在假 root 上跑通（含 inject 门禁）')
+
+  // -- 注入行 -------------------------------------------------------------- //
+
+  const table = []
+  const injectRow = handlers.get('webserver/index-inject')
+  assert.equal(typeof injectRow, 'function', '没有注册 webserver/index-inject')
+  injectRow(table)
+  assert.equal(table.length, 1, '注入行没有推上去')
+  assert.equal(table[0].kind, 'script', '注入行必须是内联 script（script-src 加载失败会 reject 掉 boot）')
+  assert.ok(table[0].text.includes(FRONT_URL), '注入行没有指向前端脚本')
+  injectRow(table)
+  assert.equal(table.length, 1, '重复的 index-inject 推出了第二条相同的行')
+  ok('桌面端注入行：内联 script、幂等')
+
+  // -- 路由 ---------------------------------------------------------------- //
+
+  for (const path of ['frontend', 'status', 'recent', 'send', 'stream']) {
+    const suffix = path === 'frontend' ? FRONT_URL : `/dsh-danmaku/v3/${path}`
+    assert.ok(routes.has(suffix), `路由没注册：${suffix}`)
+  }
+  ok('五条路由全部注册')
+
+  const frontend = fakeResponse()
+  routes.get(FRONT_URL).handler(fakeRequest(), frontend)
+  assert.ok(frontend.state.body.includes('dsh-danmaku'), '前端脚本路由没有返回脚本内容')
+  assert.equal(frontend.state.headers['content-type'], 'application/javascript; charset=utf-8')
+  ok('前端脚本路由返回 JS')
+
+  // -- 事件流 -------------------------------------------------------------- //
+
+  const stream = fakeResponse()
+  routes.get('/dsh-danmaku/v3/stream').handler(fakeRequest(), stream)
+  assert.ok(stream.state.frames[0].startsWith(': connected'), 'SSE 开头没有那条注释帧')
+
+  const toolResult = handlers.get('tools/result')
+  assert.equal(typeof toolResult, 'function', '没有监听 tools/result')
+  /*
+   * 字段名故意用真的那套：`name` / `arguments` / `agent.id`。
+   * 读成 toolName / args / sessionId 不会抛任何东西 —— 事件照样到，气泡是空的。这条断言就是拦它。
+   */
+  toolResult(
+    { name: 'read', arguments: { file_path: 'D:/Projects/dsh-plugins/dsh-danmaku/plugin/lib/index.js' }, agent: { id: 'session-a' } },
+    { isError: false },
+  )
+  const frames = stream.state.frames.join('')
+  assert.ok(frames.includes('"kind":"tool:ok"'), '工具事件没有播出去')
+  assert.ok(frames.includes('正在读取'), '工具名没有读出来（字段名可能又被读错了）')
+  assert.ok(frames.includes('lib/index.js'), '对象路径没有读出来')
+  ok('tools/result → 气泡句子（读的是 name / arguments / agent.id）')
+
+  const sessionEvent = handlers.get('session/event')
+  assert.equal(typeof sessionEvent, 'function', '没有监听 session/event')
+  sessionEvent({ id: 'session-b', title: '搬弹幕' }, { type: 'user/message', data: { content: [{ type: 'text', text: '把弹幕改成普通前端' }] } })
+  const afterUser = stream.state.frames.join('')
+  assert.ok(afterUser.includes('跟着你切到'), '用户消息没有把活跃会话切过去')
+  assert.ok(afterUser.includes('你说：把弹幕改成普通前端'), '用户消息的文本没有读出来（载荷在 event.data 里）')
+  ok('session/event → 会话锚定（user/message 是锚）')
+
+  // 别的会话的工具事件不该抢走 active。
+  const before = stream.state.frames.length
+  sessionEvent({ id: 'session-c' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '别的会话在说话' }] } } })
+  assert.equal(stream.state.frames.length, before, '非活跃会话的事件被播出去了')
+  ok('非活跃会话的事件被挡住')
+
+  /*
+   * 子代理的会话也是一个 Session，它的工具调用带着自己的 id 到达。不过滤的话，
+   * 主会话派出去一个子代理，弹幕整片就跟着子代理走了。
+   */
+  const beforeChild = stream.state.frames.length
+  sessionEvent({ id: 'subagent-1' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '子代理在干活' }] } } })
+  assert.equal(stream.state.frames.length, beforeChild, '子代理会话的事件被播出去了')
+  ok('子代理会话的事件被挡住')
+
+  // -- 回填 ---------------------------------------------------------------- //
+
+  const recent = fakeResponse()
+  routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), recent)
+  const payload = JSON.parse(recent.state.body)
+  assert.equal(payload.active, 'session-b', '回填没有带上活跃会话')
+  assert.ok(Array.isArray(payload.events) && payload.events.length > 0, '回填没有事件')
+  assert.ok(payload.events.every((event) => typeof event.text === 'string' && event.text !== ''), '有气泡没有文本')
+  ok('recent 回填带 active + 非空文本')
+
+  // -- send ---------------------------------------------------------------- //
+
+  const send = fakeResponse()
+  await routes.get('/dsh-danmaku/v3/send').handler(fakePostRequest({ sessionId: 'session-b', text: '你好' }), send)
+  const sent = JSON.parse(send.state.body)
+  assert.equal(sent.ok, true, `send 路由没有把 prompt 送出去：${send.state.body}`)
+  ok('send 路由把话送进会话')
+
+  return { routes, handlers, ctx }
+}
+
+// --------------------------------------------------------------------------- //
+// 第二段：前端（最小 DOM 里真跑一遍）
+// --------------------------------------------------------------------------- //
+
+class FakeClassList {
+  constructor(node) {
+    this.node = node
+  }
+
+  list() {
+    return String(this.node.className ?? '')
+      .split(/\s+/)
+      .filter((part) => part !== '')
+  }
+
+  write(list) {
+    this.node.className = list.join(' ')
+  }
+
+  add(...names) {
+    const list = this.list()
+    for (const name of names) if (!list.includes(name)) list.push(name)
+    this.write(list)
+  }
+
+  remove(...names) {
+    this.write(this.list().filter((name) => !names.includes(name)))
+  }
+
+  contains(name) {
+    return this.list().includes(name)
+  }
+
+  toggle(name, force) {
+    const has = this.contains(name)
+    const want = force === undefined ? !has : force === true
+    if (want && !has) this.add(name)
+    else if (!want && has) this.remove(name)
+    return want
+  }
+}
+
+class FakeStyle {
+  constructor() {
+    this.properties = new Map()
+  }
+
+  setProperty(name, value) {
+    this.properties.set(name, String(value))
+  }
+
+  getPropertyValue(name) {
+    return this.properties.get(name) ?? ''
+  }
+}
+
+class FakeNode {
+  constructor(tag) {
+    this.tagName = String(tag).toUpperCase()
+    this.children = []
+    this.parentNode = null
+    this.style = new FakeStyle()
+    this.classList = new FakeClassList(this)
+    this.listeners = new Map()
+    this.className = ''
+    this.id = ''
+    this.title = ''
+    this.type = ''
+    this.placeholder = ''
+    this.disabled = false
+    this._text = ''
+  }
+
+  get firstElementChild() {
+    return this.children.length > 0 ? this.children[0] : null
+  }
+
+  get textContent() {
+    return this._text
+  }
+
+  set textContent(value) {
+    this._text = String(value)
+    this.children.length = 0
+  }
+
+  appendChild(child) {
+    this.children.push(child)
+    child.parentNode = this
+    return child
+  }
+
+  removeChild(child) {
+    const index = this.children.indexOf(child)
+    if (index >= 0) this.children.splice(index, 1)
+    child.parentNode = null
+    return child
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, [])
+    this.listeners.get(type).push(listener)
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.listeners.get(type)
+    if (list === undefined) return
+    const index = list.indexOf(listener)
+    if (index >= 0) list.splice(index, 1)
+  }
+
+  dispatch(type, event = {}) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event)
+  }
+
+  focus() {}
+
+  getBoundingClientRect() {
+    return { left: 20, top: 30, width: 340, height: 220 }
+  }
+}
+
+function walk(node, visit) {
+  visit(node)
+  for (const child of node.children) walk(child, visit)
+}
+
+function findById(root, id) {
+  let found = null
+  walk(root, (node) => {
+    if (found === null && node.id === id) found = node
+  })
+  return found
+}
+
+function findByClass(root, className) {
+  let found = null
+  walk(root, (node) => {
+    if (found === null && node.classList.contains(className)) found = node
+  })
+  return found
+}
+
+/** 按 `title` 找控件：按钮上没有 id，而 title 是给人看的、也最稳定。 */
+function findByTitle(root, needle) {
+  let found = null
+  walk(root, (node) => {
+    if (found === null && typeof node.title === 'string' && node.title.includes(needle)) found = node
+  })
+  return found
+}
+
+class FakeEventSource {
+  constructor(url) {
+    this.url = url
+    this.onmessage = null
+    this.onerror = null
+    this.onopen = null
+    FakeEventSource.instances.push(this)
+  }
+
+  emit(event) {
+    if (this.onmessage !== null) this.onmessage({ data: JSON.stringify(event) })
+  }
+
+  static instances = []
+}
+
+function fakeFetch(url) {
+  fakeFetch.calls.push(String(url))
+  const body = String(url).includes('/recent') ? { active: '', events: [] } : { ok: true }
+  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) })
+}
+fakeFetch.calls = []
+
+function checkFrontend() {
+  /* document 上的监听器：拖动靠 document 上的 mousemove / mouseup，Esc 关详情靠 keydown。 */
+  const documentListeners = new Map()
+  const document = {
+    body: new FakeNode('body'),
+    head: new FakeNode('head'),
+    documentElement: new FakeNode('html'),
+    createElement: (tag) => new FakeNode(tag),
+    getElementById(id) {
+      return findById(document.body, id) ?? findById(document.head, id)
+    },
+    addEventListener(type, listener) {
+      if (!documentListeners.has(type)) documentListeners.set(type, [])
+      documentListeners.get(type).push(listener)
+    },
+    removeEventListener(type, listener) {
+      const list = documentListeners.get(type)
+      if (list === undefined) return
+      const at = list.indexOf(listener)
+      if (at >= 0) list.splice(at, 1)
+    },
+    dispatch(type, event = {}) {
+      for (const listener of [...(documentListeners.get(type) ?? [])]) listener(event)
+    },
+  }
+
+  const storage = new Map()
+  const sandbox = {
+    document,
+    location: { pathname: '/dsh-danmaku-check', href: 'http://127.0.0.1:19387/dsh-danmaku-check' },
+    navigator: { clipboard: null },
+    console,
+    JSON,
+    Math,
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+    EventSource: FakeEventSource,
+    fetch: fakeFetch,
+    localStorage: {
+      getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key, value) => storage.set(key, String(value)),
+    },
+    innerWidth: 1920,
+    innerHeight: 1080,
+  }
+  sandbox.window = sandbox
+  sandbox.globalThis = sandbox
+  createContext(sandbox)
+
+  runInContext(readFileSync(FRONT_FILE, 'utf8'), sandbox, { filename: 'bubbles.js' })
+  ok('前端脚本在最小 DOM 里跑通（没有一跑就抛）')
+
+  const root = findById(document.body, ROOT_ID)
+  assert.ok(root !== null, `没有挂出 #${ROOT_ID}`)
+  assert.ok(document.getElementById('dsh-danmaku-style') !== null, '没有注入样式')
+  ok('建出根节点与样式')
+
+  /* 只有气泡和按钮可以在指针上"存在"，其余一切必须穿透——否则 overlay 里会整块桌面点不动。 */
+  const stack = findByClass(root, 'dshd-stack')
+  assert.ok(stack !== null, '没有气泡栈')
+  ok('根节点 / 气泡栈就位')
+
+  assert.equal(FakeEventSource.instances.length, 1, '没有建 SSE 连接')
+  assert.ok(FakeEventSource.instances[0].url.endsWith('/dsh-danmaku/v3/stream'), 'SSE 地址不对')
+  assert.ok(fakeFetch.calls.some((url) => url.includes('/recent')), '没有回填请求')
+  ok('SSE 连接 + recent 回填')
+
+  const source = FakeEventSource.instances[0]
+  source.emit({ kind: 'tool:ok', text: '正在读取 lib/index.js', detail: 'read\n\nfile_path:\nD:/a/lib/index.js', session: 'session-a' })
+  assert.equal(stack.children.length, 1, '事件没有变成气泡')
+  assert.equal(stack.children[0].textContent, '正在读取 lib/index.js')
+  assert.ok(stack.children[0].classList.contains('dshd-bubble'))
+  assert.equal(stack.children[0].style.getPropertyValue('--dshd-accent'), '#5B93EE', '按 kind 取色没生效')
+  ok('一条事件 → 一颗按 kind 上色的气泡')
+
+  stack.children[0].dispatch('click')
+  const detail = findByClass(root, 'dshd-detail')
+  assert.ok(detail.classList.contains('dshd-open'), '点击气泡没有打开详情')
+  ok('点气泡打开详情')
+
+  for (let index = 0; index < 12; index += 1) {
+    source.emit({ kind: 'assistant', text: `我说：第 ${String(index)} 条`, detail: 'x', session: 'session-a' })
+  }
+  assert.equal(stack.children.length, 6, `气泡数应当被压到 6，现在是 ${String(stack.children.length)}`)
+  assert.ok(stack.children[stack.children.length - 1].textContent.includes('第 11 条'), '被留下的不是最新的那几条')
+  ok('气泡上限 6 条，挤掉的是最旧的')
+
+  source.emit({ kind: 'session:switch', text: '跟着你切到 搬弹幕', session: 'session-b' })
+  assert.equal(stack.children.length, 1, '切会话没有清空旧气泡')
+  assert.ok(stack.children[0].textContent.includes('搬弹幕'))
+  ok('切会话清空并提示')
+
+  /* 没有详情的气泡不该做得像能点开——点开一个正文和气泡上一模一样的窗口比不开更糟。 */
+  source.emit({ kind: 'turn:end', text: '这一轮结束了', detail: '', session: 'session-b' })
+  const last = stack.children[stack.children.length - 1]
+  assert.ok(last.classList.contains('dshd-flat'), '没有详情的气泡仍被做成可点')
+  ok('无详情的气泡不可点')
+
+  /*
+   * 交互三件事：淡化、输入条、拖动。
+   *
+   * 这三条都在真机上验过一遍（点气泡开详情、◐ 淡化到 0.24、✎ 展开、拖动把位置写进
+   * localStorage），在这里钉住是为了以后改样式或改事件时能立刻发现踩坏了。
+   */
+  const eye = findByTitle(root, '淡出')
+  assert.ok(eye !== null, '找不到淡化按钮')
+  eye.dispatch('click')
+  assert.ok(root.classList.contains('dshd-hidden'), '◐ 没有把浮层切到隐藏态')
+  eye.dispatch('click')
+  assert.ok(!root.classList.contains('dshd-hidden'), '◐ 再点一次没有恢复')
+  ok('◐ 淡化 / 恢复')
+
+  const pen = findByTitle(root, '发一句话')
+  assert.ok(pen !== null, '找不到输入条按钮')
+  const composer = findByClass(root, 'dshd-composer')
+  pen.dispatch('click')
+  assert.ok(composer.classList.contains('dshd-open'), '✎ 没有展开输入条')
+  pen.dispatch('click')
+  assert.ok(!composer.classList.contains('dshd-open'), '✎ 没有收起输入条')
+  ok('✎ 输入条展开 / 收起')
+
+  const grip = findByClass(root, 'dshd-grip')
+  assert.ok(grip !== null, '找不到拖动把手')
+  /* 假 DOM 的 getBoundingClientRect 是 (20,30)，所以 offset = (10,10) ⇒ 落点 490,190。 */
+  grip.dispatch('mousedown', { button: 0, clientX: 30, clientY: 40, preventDefault() {} })
+  document.dispatch('mousemove', { clientX: 500, clientY: 200 })
+  document.dispatch('mouseup', {})
+  assert.equal(root.style.left, '490px', '拖动没有把浮层挪过去')
+  assert.equal(root.style.top, '190px', '拖动没有把浮层挪过去')
+  assert.equal(storage.get('dsh-danmaku:pos:page'), '{"left":490,"top":190}', '拖动后的位置没有记进 localStorage')
+  ok('拖动 + 位置记忆')
+}
+
+// --------------------------------------------------------------------------- //
+
+console.log('host 半边：')
+await checkHost()
+console.log('前端：')
+checkFrontend()
+console.log(`\n全部通过（${String(passed)} 项）`)

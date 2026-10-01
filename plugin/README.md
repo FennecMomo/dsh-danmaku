@@ -1,182 +1,195 @@
-# dsh-plugin-danmaku
+# dsh-danmaku · plugin
 
-会话标题旁的「弹幕」按钮，以及弹幕窗口读取的事件流。装进 `desktop` profile，
-随 harness 一起启动。
+会话事件的弹幕浮层，标准 DSH bundle 插件：装进 profile 的 `dsh.profile.bundles`，随 harness 一起启动。
 
-## 为什么这是一个插件包，而不是动态 Cordis 插件
+两半：**host 半边**（`lib/index.js`）把会话里发生的事读成一句话并广播出去；**前端**（`lib/bubbles.js`）
+是一份自包含脚本，被注进页面里画气泡。前端那份**同时挂在两个宿主**（DSH 页面、桌面 overlay 窗口），
+但只有一份代码。
 
-动态 Cordis 插件**只活在当前进程里**。下次重启就没有那一行了，
-所以按钮根本不存在 —— 不是「没自动启用」，是「没东西可启动」。
+---
 
-这个包放在 `~/.dsh/profiles/desktop/cordis.patch.yml` 里，那个文件**每次启动都会读**，
-所以能力跟着进程一起回来。
-
-## 它提供什么
+## 五条路由
 
 | 路由 | 用途 |
-|---|---|
-| `GET /dsh-danmaku/v3/status` | 按钮轮询面板状态 |
-| `POST /dsh-danmaku/v3/toggle` | 开/关弹幕窗口 |
-| `GET /dsh-danmaku/v3/stream` | SSE，面板的实时事件源 |
-| `GET /dsh-danmaku/v3/recent` | JSON 回填 |
+| --- | --- |
+| `GET /dsh-danmaku/v3/bubbles.js` | 前端本体，按 mtime 热读（改完刷新页面即生效） |
+| `GET /dsh-danmaku/v3/stream` | SSE，实时事件 |
+| `GET /dsh-danmaku/v3/recent` | JSON 回填：`{ active, activeTitle, events }` |
+| `POST /dsh-danmaku/v3/send` | 把一句话发进会话（前端那条折叠输入框用） |
+| `GET /dsh-danmaku/v3/status` | 诊断：活跃会话、事件数、客户端数、前端文件状态、SSE 错误 |
 
-四条路由都用 `ctx.effect` 注册，所以停用或更新这个插件会把四条一起撤掉。
+五条都走 `ctx.effect` 注册，插件停用/更新时一起撤掉。留下一条还在应答的路由，就是一个插件
+"该走了却还在说话"的样子。
 
-## 为什么走 HTTP 而不是 `harness.handle` / `host.call`
+`status` 里两个字段是专门为排查留的：`clients` 是当前 SSE 连接数（断掉的连接会被就地摘掉，
+所以它不该一直涨），`lastStreamError` 记着 stream handler 里最后一次抛出来的东西 —— 见下面第 1 条坑。
 
-那一对 RPC 是**动态插件专属**的，持久插件没有。`webServer.register` 给的是普通的
-Node `req` / `res`，所以页面直接走 HTTP 和这个插件说话。
+---
 
-## 路径怎么找
-
-弹幕窗口是 Python，和这个包放在**同一个仓库**里（本仓库的 `danmaku/`）。
-包不从磁盘猜路径：入口文件往上两级就是仓库根，`danmaku/` 就在它下面，所以
-仓库搬到哪台机器、放在哪个路径都不用改，直接 `dsh --profile desktop` 也能用。
-
-面板放在别处时再用环境变量覆盖：
-
-| 变量 | 作用 |
-|---|---|
-| `DSH_DANMAKU_DIR` | 直接指定弹幕目录 |
-| `DSH_DESKTOP_HOME` | 指定一个目录，包在它下面找 `danmaku/` |
-| `DSH_DANMAKU_PYTHON_DIR` | 含有 `python.exe` / `pythonw.exe` 的目录 |
-
-## 安装
-
-在 profile 的 `cordis.patch.yml` 里加一行：`name` 用**入口文件的绝对路径**。
-路径形式的 loader name 会直接解析到最近的 `package.json`，所以
-不需要 `dsh plugin add`，也不需要 pnpm 安装 —— 这个包待在哪个目录都行，
-和 DSH 的安装目录没有关系。
-
-```yaml
-- insert:
-    - id: danmaku-overlay
-      name: 'file:///D:/Projects/dsh-plugins/dsh-danmaku/plugin/lib/index.js'
-```
-
-改完要**重启一次 harness**（关掉桌面端再打开）。
-
-## 八个不能搞错的地方
-
-1–3 是「命令看起来没问题、结果什么都没有」，4–8 是「包看起来加载了、按钮就是不出现」。
-
-**1. `name` 必须指向入口文件，不能指向包目录。**
+## 前端挂两处，注入通道是一条
 
 ```
-name: 'file:///D:/Projects/dsh-plugins/dsh-danmaku/plugin'              # ✗ ERR_UNSUPPORTED_DIR_IMPORT
-name: 'file:///D:/Projects/dsh-plugins/dsh-danmaku/plugin/lib/index.js' # ✓
+              ┌── DSH 页面 ──────── webserver/index-inject 的结构化行
+host 半边 ────┤                     web 形态：renderIndex() 把行渲染进 index
+              │                     桌面端：宿主 collectIndexInjections() 收集后经 IPC 交给渲染层
+              └── overlay 页面 ───── dsh-desktop-overlay 的 WHITELIST 引入
 ```
 
-Node 的 ESM 加载器不接受目录导入。指到目录上，整个 harness 起不来。
+**一条行，两个宿主。** 实测确认：只注册了 `webserver/index-inject`，没有写 `tapIndex`，
+而 curl DSH 的 index 里就有我们那行内联 loader（它出现在 `__DSH_BOOT_READY__` 之前）：
 
-**2. 客户端半边必须声明 `slots`，而且要用 `ctx.slots` —— 这是最难查的一个。**
-
-```js
-exports.inject = ['slots']     // ✓ 必须声明
-ctx.slots.inject(...)          // ✓ 声明过的服务用属性形式
-
-exports.inject = []            // ✗
-var slots = ctx.get('slots')   // ✗ 返回 undefined，apply 直接 return，什么都没注册
+```html
+<script>(function(){try{var d=document.body||document.head||document.documentElement;
+if(!d)return;var s=document.createElement("script");s.src="/dsh-danmaku/v3/bubbles.js";
+s.onerror=function(){};d.appendChild(s)}catch(e){}})()</script>
 ```
 
-客户端 facade 对服务读取**有门禁**：没在 `inject` 里声明的服务 `ctx.get()`
-拿不到；而 `ctx.slots` 这种属性形式**只有声明过才解析**。
+两边的差别在**什么时候收集**：web 形态每次 `renderIndex()` 都重新 `collectIndexInjections()`（所以那行是动态的），
+桌面端是宿主启动时收集一次后缓存、没有刷新路径。后者决定了下面两条硬规矩。
 
-这个失败**在 host 侧没有任何症状** —— 没有报错、没有 404、没有日志，
-只有浏览器控制台里一行。这是它耗掉最多轮次的原因：我们一直在看不见反馈的
-情况下推理。最后是靠让客户端把每一步 POST 回 host 才定位到的：
+**规矩一：注册必须在 `apply()` 的一开头**，不能放进 `root.inject([...])` 里等服务就绪 ——
+服务晚一点，这一行就永远进不了表，症状是"桌面端弹幕从不出现"，而 host 侧没有任何报错。
+本插件因此**故意没有对象级 `inject`**（`export const inject = [...]`），`tools/check.mjs`
+里有一条断言专门拦它。
+
+**规矩二：行必须是内联 `<script>` 文本，不能是 `script-src` 行。** 页面侧解释器对两种行的处理不对称：
+`script` 行是 `createElement` + `textContent`（没有 await，不可能失败），`script-src` 行是
+`await loadScript(src)`（**加载失败会 reject 掉 `__DSH_BOOT_READY__`，整个应用起不来**）。
+我们的路由在插件被停用后就是 404，所以这里自己建标签、自己吞掉 `onerror`：
+路由在就正常加载，路由不在就静默失败，宿主永远不会因为我们起不来。
+
+`webServer.tapIndex`（裸 HTML 变换）是"结构化行表达不了的标记"的逃生口，本插件没有用到。
+
+行本身是最朴素的那种：`{ kind: 'script', placement: 'body', text: '<一段内联 IIFE>' }`。
+宿主侧的 `renderRow` 认这个形状（`script` 渲染成 `<script>${text}</script>`，`placement` 照用），
+而**鲸鱼挂件用的是同一个形状、并且已经在这台桌面客户端上跑通了** —— 这是"重启后它也会被认"
+最便宜的一条旁证。
+
+---
+
+## 弹幕跟着哪个会话
+
+一个浮层只显示一个会话的事件，规则三条：
+
+1. **用户消息是锚。** `user/message` 到达时，那个会话就是"你现在在看的那个"，浮层清空并提示切换。
+   其余事件（工具、助手文本）只跟着锚走，不抢。
+2. **没有锚时用第一条带会话的事件落位**（刚启动、或者这一轮还没有用户消息）。
+3. **子代理的会话不播。** 子代理也是 Session，它的工具调用带着自己的 id 到达。不过滤的话，
+   主会话派一个子代理出去，整片弹幕就跟着子代理走了。判定用 `ctx.get('agents').roots()`；
+   服务不在或者列表为空时**不拦**（宁可多显示，也不要因为拿不到列表就整片哑掉）。
+
+---
+
+## 六个坑（都是实测的，不是推测）
+
+**1. `timer` 必须在 `inject` 里 —— 否则 SSE 会在响应头发出之后炸掉。**
+
+Cordis 的 context 是个 Proxy：**没在 inject 里声明过的服务，属性访问会抛**
+`cannot get property "timer" without inject`。而 `ctx.interval` 属于 `timer` 服务，它当时不在
+inject 列表里（原来的版本是从客户端半边抄来的，那边是另一套门禁），于是：
 
 ```
-module-evaluated   factory entered
-apply-entered      ctx type=object
-apply-slots        undefined        ← 就是这里
+SSE handler → writeHead(200) → write(': connected')  → ctx.interval(...) 抛错
+webServer   → 响应头已发出 ⇒ 直接销毁 socket（外加一条 logger.warn）
+浏览器      → open 之后 1 毫秒 error ⇒ 前端无限重连，屏幕上一条实时事件都没有
 ```
 
-**3. `active: false` 的含义是确定的：那个 entry 渲染时抛异常了。**
+现场完全没有指向 inject 的线索：路由是 200、前端不报错、`recent` 回填正常（所以气泡看起来是有的），
+只有"新的不来"。定位方式是拿一个**临时探针插件**（新包 = 新模块 = 立刻生效）把每一步的成败记下来
+再读出来，一行就写明白了。
 
-```js
-entriesOfSlot(t) { for (const c of r.entries) { if (this.abdicated.has(c)) continue; ... } }
+推论：**`ctx.get('name')` 与 `ctx.name` 不是一回事。** `get()` 是宽松读取（拿不到给 undefined），
+属性访问受 inject 门禁约束。所以要可选依赖就用 `get()`，要属性形式就老老实实写进 inject。
+
+**2. 改了 host 代码，"禁用再启用"不会加载新代码。**
+
+Node 的 ESM 缓存按 specifier 命中，重新实例化执行的还是旧模块 —— 现象是"改动像没生效，但文件时间戳
+确实更新了"（因为旧模块的 `apply` 又跑了一遍）。**唯一可靠的办法是重启 DSH 客户端。**
+真要在不重启的情况下迭代 host 代码，只有换 specifier（例如改 `main` 指向新文件名）。
+
+前端不在此列：`bubbles.js` 是按 mtime 热读的，改完**刷新页面**即生效。
+
+**3. 事件字段名是 `exec.name` / `exec.arguments` / `exec.agent.id`。**
+
+不是 `toolName` / `args` / `sessionId`。读错名字不报错 —— 事件照常到达，只是气泡里既没有工具名
+也没有对象，所以"看起来没坏"但内容是空的。
+
+**4. `session/event` 的载荷在 `event.data` 里。**
+
+`SessionEvent` 的形状是 `{ type, seq, time, data }`。曾经读的是 `event.reason` 和 `event.text`
+（两个都不存在），同样什么都不抛，只是每颗气泡都是空的。
+
+**5. 断掉的 SSE 连接不会自己从表里消失 —— 顺序要摆对。**
+
+`broadcast` 里写失败时就地删除，只是第一层；更要紧的是 **stream handler 里的顺序：
+先把 `close` 处理器挂上，最后才把 `res` 放进 listeners**。反过来的话，中间任何一步抛错都会留下
+一条永远摘不掉的连接（close 还没注册，而它已经入表了）。timer 那个 bug 就是这样留下了
+**11 条尸体** —— `status` 里的 `clients` 一路涨到两位数，看起来像"有一堆客户端连着"。
+现在先挂钩子、最后入表，且 handler 里每一步抛错都记进 `lastStreamError`。
+
+**6. 别在 overlay 页面里做拖动。**
+
+指针一旦离开可交互元素，外壳就恢复鼠标穿透，`mousemove` 立刻断掉，拖动会半途而废。
+桌面上的落点本来也该固定在右下角，所以 overlay 里不做拖动，DSH 页面里才可以（位置记在
+localStorage 里，两个宿主各存一份）。
+
+同样的道理决定了前端样式里唯一一条硬规矩：**容器必须 `pointer-events: none`，只有气泡和按钮
+`auto`**。违反它的后果不是"点不到"，而是"整块桌面点不动" —— 那正是 overlay 那层费了很大劲避开的事。
+
+---
+
+## 自检
+
+```powershell
+node tools/check.mjs
 ```
 
-`abdicated` 这个 WeakSet **只由 `reportEntryError(..., {abdicate: true})` 写入**。
-`register()` 只把 entry 推进 `i.entries`，不会让它变 false。
-所以看到 `active: false` 就不必再猜「注册失败了」。
+离线跑两半，23 项：
 
-**4. 事件字段名是 `exec.name` / `exec.arguments` / `exec.agent.id`。**
+- **host**：导出形状（含"不许有对象级 inject"）、注入行幂等、五条路由、工具事件读的是真字段名、
+  用户消息锚定活跃会话、非活跃会话与子代理会话被挡住、`recent` 形状、`send` 通路。
+- **前端**：在一套最小 DOM 里真跑一遍 —— 建根节点、SSE 与回填、一条事件变成一颗按 kind 上色的气泡、
+  点开详情、气泡上限 6 条挤掉最旧的、切会话清空、没有详情的气泡不可点，以及三件交互
+  （◐ 淡化/恢复、✎ 输入条展开/收起、拖动 + 位置记忆）。
 
-不是 `toolName` / `args` / `sessionId`。读错名字不报错 —— 事件照常到达，
-只是气泡里没有工具名也没有对象，所以「看起来没坏」但内容是空的。
+假 ctx 复刻了 Cordis 的 inject 门禁（第 1 条坑），所以"忘了声明 timer"这类问题在自检里就会现形，
+不必等到真机。
 
-**5. 静态 bundle 拿得到 `window` 和 `fetch`。**
+`tools/verify-live.mjs` 管的是另一半：对着**正在跑的那台机器**问四个问题 —— host 是不是新代码、
+SSE 长连接稳不稳、DSH 的 index 里有没有前端 loader、overlay 白名单里有没有。改完 host 代码
+重启之后拿它复核；它需要 `/dsh-danmaku/v3/status` 和 `/dsh-overlay`，index 那一项要凭据
+（从旁边 overlay 仓库的 `.launch-url.txt` 读 fresh token，读不到就跳过那一项而不算失败）。
 
-`setInterval`/`fetch`/`require` 的教学陷阱**只由 `evaluateClientHalf` 安装**，
-而它只给**动态插件**用 `new Function` 造闭包。静态 bundle 走
-`window.__ModuleLoader__.load`，不受影响。所以轮询可以直接用
-`window.setInterval`，不需要声明 `timer` —— 少一个声明就少一种被 park 的可能。
+---
 
-**6. 探测用 `python.exe`，启动用 `pythonw.exe`。**
-`pythonw.exe` 是 GUI 子系统程序，没有控制台。给它一根 stdout 管道，
-Windows 是**直接丢掉**而不是接上去。实测三次：同一条 `--status`，
-`pythonw` 返回退出码 0 加空字符串，`python` 每次都给完整结果。
+## 界面出问题时怎么查
 
-**7. 启动走 `subprocess.spawn`，探测走 `ctx.shell`。**
-`ctx.shell` 在命令结束时会**连带杀掉整棵进程树**，用它启动的面板活不过几秒，
-而且死得很安静（启动日志已经写出来了，看起来像崩溃）。探测不启动任何东西，
-而且只有 `ctx.shell` 的返回值带 stdout —— `subprocess` 的完成结果只有
-`{ exitCode, signal }`。
+前端在**两个**地方跑，而两边的失败都是安静的：DSH 页面里它只是"没出现"，overlay 页面里更是
+没人会去开 devtools。所以先建立观测，再猜：
 
-**8. `ctx.shell` 是 PowerShell，不是 bash。**
-PowerShell 会把开头的引号字符串当成**字符串字面量**，给程序名加引号会直接报
-`Unexpected token`。程序名必须裸写，只有参数加引号。
+```powershell
+# host 半边活着吗、在跟谁、SSE 有没有客户端
+curl.exe -s http://127.0.0.1:<port>/dsh-danmaku/v3/status
 
-## 界面出问题时怎么查 —— 先建立观测
+# 前端本体在不在（200 就是路由在）
+curl.exe -s -o NUL -w "%{http_code}" http://127.0.0.1:<port>/dsh-danmaku/v3/bubbles.js
 
-这是这个包最贵的一课：**一个不注册的 client bundle，在 host 侧完全没有痕迹。**
-只能读 host 的话，就必须先给自己开一条从浏览器回来的路。
-
-```js
-// host 侧加一条临时路由
-ctx.webServer.register({ kind: 'exact', path: '/.../report', handler: ... })
-
-// client 侧每一步都 POST 回去。window.onerror 放最前面 ——
-// 模块求值阶段抛异常时，后面的上报还来不及跑
-window.addEventListener('error', (e) => report('window.onerror', e.message))
-report('module-evaluated')
-report('apply-slots', slots === undefined ? 'undefined' : typeof slots)
+# 手动灌一份前端进页面（浏览器控制台 / CDP 都能用），看它到底会不会建出来
+var s=document.createElement('script');s.src='/dsh-danmaku/v3/bubbles.js';document.body.appendChild(s)
 ```
 
-再加上 slot 表（读它不需要浏览器）：
+页面里那两个诊断入口：`document.getElementById('dsh-danmaku-root')` 在不在，
+以及 `.dshd-note` 那一行文字（断流、发送失败都会写在那里）。
 
-```js
-Slots.listSubTree({ root: 'conversation.session.header.actions' })
-// 看不到自己的 id  = 没注册（apply 里就 return 了，或者根本没跑）
-// active: false    = 注册了，但渲染时抛异常
-```
+overlay 那一侧另有一套：外壳每秒把状态写进 `dsh-desktop-overlay/shell/.shell-status.json`，
+里面 `overlayVisible` / `interactive` / `reloads` 能回答"窗口到底有没有浮出来"。
 
-两条信息一交叉，剩下的就只是读那一行错误文本。
+---
 
-两边都能在 Node 里单独验，不用重启也不用刷新：
+## 缓存与生效边界（一张表）
 
-```sh
-# host 半边
-node -e "import('file:///D:/Projects/dsh-plugins/dsh-danmaku/plugin/lib/index.js').then(m => console.log(m.inject))"
-
-# client 半边：搭一个假的 __ModuleLoader__ 和一个假的 react
-node -e "const vm=require('vm'),fs=require('fs');const reg=[];vm.runInNewContext(fs.readFileSync('plugin/lib/client.js','utf8'),{window:{__ModuleLoader__:{load:r=>reg.push(r)}},console});const m=reg[0].factory(()=>({useState:()=>[0,()=>{}],useEffect:()=>{},createElement:()=>({})}));console.log(Object.keys(m),m.inject)"
-```
-
-**缓存边界**：`plugin/lib/client.js` 的改动会被 `clientModules` 的 watcher 捡到并换 rev，
-所以**刷新页面**就能拿到新 bundle；但 host 半边（`lib/index.js`）**必须重启**才生效。
-
-## 客户端 bundle
-
-`lib/client.js` 是手写的，所以用的是 loader 真正消费的格式：
-
-- `window.__ModuleLoader__.load({ id, factory })`，factory 返回 `module.exports`
-- 插件就是模块的 `apply` / `inject` 导出 —— **不是** return 一个对象
-  （那是动态包的形状，在这里加载不起来）
-- 没有 JSX 和 TS 编译，所以用 `React.createElement`
-- 只有这几个模块能从 `require` 拿到：`react`、`react/jsx-runtime`、`react-dom`、
-  `@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-store`、
-  `@deepseek-ai/dsh-client-ui-slots`、`@deepseek-ai/dsh-client-ui-primitives`、
-  `@deepseek-ai/dsh-client-ui-dockkit`
+| 改了什么 | 怎么生效 |
+| --- | --- |
+| `plugin/lib/bubbles.js`（前端） | 刷新页面；overlay 里浮出来之前外壳会自己 `reload()` |
+| `plugin/lib/index.js`（host） | **重启 DSH 客户端**（禁用再启用不算） |
+| `dsh-desktop-overlay` 的 `WHITELIST` | 重启 DSH 客户端（那是它 host 半边里的常量） |

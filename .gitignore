@@ -23,25 +23,15 @@ service-account*.json
 # 依赖
 node_modules/
 
-# Python 缓存与构建产物
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-build/
-dist/
-
-# 弹幕面板的运行时状态。settings.json 故意不忽略 —— 它保存的是调好的外观
-# （背景透明度、尺寸、气泡上限、位置），把它带到另一台机器正是这个仓库的用意。
-danmaku/.panel-startup.log
-danmaku/.panel-status.json
-danmaku/.panel-done.json
-danmaku/.panel-error.log
-danmaku/.panel-stop
-danmaku/.panel-command
-danmaku/logs/
-danmaku/probe-*.png
-danmaku/compare-*.png
-
 # 提交信息暂存文件（命令行没法传 heredoc 时用的）
 .git-commit-msg.tmp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 这里曾经有一整段 `danmaku/*.log` / `danmaku/.panel-*` 的忽略规则。那套 Python
+# 悬浮窗（自绘 layered window + 状态文件 + 停止脚本）已经删掉了：透明、置顶、
+# 鼠标穿透现在由 dsh-desktop-overlay 的窗口负责，前端是一份普通脚本，没有运行
+# 时状态落盘，也就没有东西需要忽略。
+#
+# 顺带把 Python 的缓存段（__pycache__ / *.py[cod] / .venv）也去掉了 —— 那个语言
+# 已经不在这个仓库里，留着只会让人以为还有 .py 文件。真要放回来，记得一起加回。
+# ─────────────────────────────────────────────────────────────────────────────
