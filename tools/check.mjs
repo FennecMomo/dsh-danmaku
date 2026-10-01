@@ -198,11 +198,11 @@ async function checkHost() {
 
   // -- 路由 ---------------------------------------------------------------- //
 
-  for (const path of ['frontend', 'status', 'recent', 'send', 'stream', 'sessions', 'focus']) {
+  for (const path of ['frontend', 'status', 'recent', 'send', 'stream', 'sessions', 'focus', 'place']) {
     const suffix = path === 'frontend' ? FRONT_URL : `/dsh-danmaku/v3/${path}`
     assert.ok(routes.has(suffix), `路由没注册：${suffix}`)
   }
-  ok('七条路由全部注册')
+  ok('八条路由全部注册')
 
   const frontend = fakeResponse()
   routes.get(FRONT_URL).handler(fakeRequest(), frontend)
@@ -234,17 +234,43 @@ async function checkHost() {
 
   const sessionEvent = handlers.get('session/event')
   assert.equal(typeof sessionEvent, 'function', '没有监听 session/event')
-  sessionEvent({ id: 'session-b', title: '搬弹幕' }, { type: 'user/message', data: { content: [{ type: 'text', text: '把弹幕改成普通前端' }] } })
-  const afterUser = stream.state.frames.join('')
-  assert.ok(afterUser.includes('跟着你切到'), '用户消息没有把活跃会话切过去')
-  assert.ok(afterUser.includes('你说：把弹幕改成普通前端'), '用户消息的文本没有读出来（载荷在 event.data 里）')
-  ok('session/event → 会话锚定（user/message 是锚）')
 
-  // 别的会话的工具事件不该抢走 active。
+  /*
+   * 第一条带会话的事件**落位一次** —— 落位之后画面就钉在这儿。
+   * 这是"自动跟随"唯一剩下的部分：选定之后别再自己换，是主人明确要的。
+   */
+  const afterFirst = stream.state.frames.join('')
+  assert.ok(afterFirst.includes('现在看'), '第一条事件没有落位到那个会话')
+  ok('第一条带会话的事件落位一次')
+
+  /* 别的会话里用户说话，也**不再**把画面换走。 */
+  const beforeUser = stream.state.frames.length
+  sessionEvent({ id: 'session-b', title: '搬弹幕' }, { type: 'user/message', data: { content: [{ type: 'text', text: '把弹幕改成普通前端' }] } })
+  assert.equal(stream.state.frames.length, beforeUser, '别的会话说话又把画面换走了 —— 自动跟随应当已经去掉')
+  ok('选定之后不再自动跟随（用户消息也不换画面）')
+
+  /* 气泡上不该再有「我说：」「你说：」——气泡的颜色和位置已经在说是谁了。 */
+  sessionEvent({ id: 'session-a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '**加粗** 和 `代码`\n## 标题' }] } } })
+  const spoken = stream.state.frames.join('')
+  assert.ok(!spoken.includes('我说：'), '气泡上还带着「我说：」前缀')
+  assert.ok(!spoken.includes('你说：'), '气泡上还带着「你说：」前缀')
+  ok('气泡去掉了「我说：」「你说：」前缀')
+
+  /* Markdown 标记要洗掉：气泡不渲染 Markdown，留着就只剩噪音。 */
+  /* 只看气泡文本（`text`）—— `detail` 是故意留原文的，那里有 `**` 才对。 */
+  const spokenTexts = stream.state.frames
+    .filter((frame) => frame.startsWith('data: '))
+    .map((frame) => JSON.parse(frame.slice(6)).text)
+    .join(' | ')
+  assert.ok(spokenTexts.includes('加粗 和 代码 标题'), 'Markdown 标记没有被洗掉')
+  assert.ok(!spokenTexts.includes('**'), '气泡文本里还留着 ** 标记')
+  ok('气泡洗掉了 Markdown 标记（detail 仍保留原文）')
+
+  // 别的会话的事件不该抢走画面。
   const before = stream.state.frames.length
   sessionEvent({ id: 'session-c' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '别的会话在说话' }] } } })
-  assert.equal(stream.state.frames.length, before, '非活跃会话的事件被播出去了')
-  ok('非活跃会话的事件被挡住')
+  assert.equal(stream.state.frames.length, before, '非选定会话的事件被播出去了')
+  ok('非选定会话的事件被挡住')
 
   /*
    * 子代理的会话也是一个 Session，它的工具调用带着自己的 id 到达。不过滤的话，
@@ -260,10 +286,11 @@ async function checkHost() {
   const recent = fakeResponse()
   routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), recent)
   const payload = JSON.parse(recent.state.body)
-  assert.equal(payload.active, 'session-b', '回填没有带上活跃会话')
+  assert.equal(payload.active, 'session-a', '回填没有带上选定的会话')
+  assert.ok(payload.place !== null && typeof payload.place.right === 'number', '回填没有带上浮层位置')
   assert.ok(Array.isArray(payload.events) && payload.events.length > 0, '回填没有事件')
   assert.ok(payload.events.every((event) => typeof event.text === 'string' && event.text !== ''), '有气泡没有文本')
-  ok('recent 回填带 active + 非空文本')
+  ok('recent 回填带 active + place + 非空文本')
 
   // -- send ---------------------------------------------------------------- //
 
@@ -278,7 +305,7 @@ async function checkHost() {
   const listResponse = fakeResponse()
   routes.get('/dsh-danmaku/v3/sessions').handler(fakeRequest(), listResponse)
   const list = JSON.parse(listResponse.state.body)
-  assert.equal(list.focused, '', '一开始应当是自动跟随')
+  assert.equal(list.focused, 'session-a', '落位之后应当选中第一个开口的会话')
   const ids = list.sessions.map((row) => row.id)
   assert.ok(
     ids.includes('session-a') && ids.includes('session-b') && ids.includes('session-c'),
@@ -337,8 +364,24 @@ async function checkHost() {
 
   const resumed = fakeResponse()
   await focusRoute.handler(fakePostRequest({ sessionId: '' }), resumed)
-  assert.equal(JSON.parse(resumed.state.body).focused, '', '空串没有恢复自动跟随')
-  ok('POST /focus 空串恢复自动跟随')
+  assert.equal(JSON.parse(resumed.state.body).focused, '', '空串没有回到未选状态')
+  ok('POST /focus 空串回到未选状态（下一次事件重新落位）')
+
+  // -- 浮层位置 -------------------------------------------------------------- //
+
+  const placeRoute = routes.get('/dsh-danmaku/v3/place')
+  const placed = fakeResponse()
+  await placeRoute.handler(fakePostRequest({ right: 40, bottom: 200 }), placed)
+  const placeBody = JSON.parse(placed.state.body)
+  assert.equal(placeBody.ok, true, 'place 没有接受位置')
+  assert.equal(placeBody.right, 40, 'right 没记对')
+  assert.equal(placeBody.bottom, 200, 'bottom 没记对')
+  ok('POST /place 记下位置（只收 right/bottom）')
+
+  const badPlace = fakeResponse()
+  await placeRoute.handler(fakePostRequest({ right: -5, bottom: 10 }), badPlace)
+  assert.equal(badPlace.state.status, 400, '负数位置没有被拒绝')
+  ok('POST /place 拒绝负数位置')
 
   return { routes, handlers, ctx }
 }
@@ -469,7 +512,8 @@ class FakeNode {
   focus() {}
 
   getBoundingClientRect() {
-    return { left: 20, top: 30, width: 340, height: 220 }
+    /* 真实 DOMRect 有 right/bottom，浮层拖动正是靠它们算"右下角"，所以这里也得给齐。 */
+    return { left: 20, top: 30, width: 340, height: 220, right: 360, bottom: 250 }
   }
 }
 
@@ -634,8 +678,19 @@ async function checkFrontend() {
   assert.equal(stack.children.length, 1, '事件没有变成气泡')
   assert.equal(stack.children[0].textContent, '正在读取 lib/index.js')
   assert.ok(stack.children[0].classList.contains('dshd-bubble'))
-  assert.equal(stack.children[0].style.getPropertyValue('--dshd-accent'), '#5B93EE', '按 kind 取色没生效')
+  assert.equal(
+    stack.children[0].style.getPropertyValue('--dshd-accent'),
+    '#3F5A7A',
+    '按 kind 取色没生效（动作类是低饱和的冷灰蓝）',
+  )
   ok('一条事件 → 一颗按 kind 上色的气泡')
+
+  /* 主人要的是"动作和说的话一眼分得开"：两族的**底色**也得不同，不能只差一角边框。 */
+  const toolFill = stack.children[0].style.getPropertyValue('--dshd-fill')
+  source.emit({ kind: 'assistant', text: '一句话', detail: '', session: 'session-a' })
+  const talkFill = stack.children[1].style.getPropertyValue('--dshd-fill')
+  assert.notEqual(toolFill, talkFill, '动作和说话的底色一样 —— 那就不叫"一眼分得开"')
+  ok('动作与说话用不同底色')
 
   stack.children[0].dispatch('click')
   const detail = findByClass(root, 'dshd-detail')
@@ -685,14 +740,23 @@ async function checkFrontend() {
 
   const grip = findByClass(root, 'dshd-grip')
   assert.ok(grip !== null, '找不到拖动把手')
-  /* 假 DOM 的 getBoundingClientRect 是 (20,30)，所以 offset = (10,10) ⇒ 落点 490,190。 */
+  /*
+   * 假 DOM 的 rect 是 (20,30,340,220) ⇒ right=360、bottom=250；抓在 (30,40) ⇒ offset (330,210)；
+   * 移到 (500,200) ⇒ right = 1920-830 = 1090、bottom = 1080-410 = 670。
+   *
+   * 位置**只记 right/bottom**：用 left/top 就等于把顶边钉死，内容一长工具行就被推出屏幕。
+   */
   grip.dispatch('mousedown', { button: 0, clientX: 30, clientY: 40, preventDefault() {} })
   document.dispatch('mousemove', { clientX: 500, clientY: 200 })
   document.dispatch('mouseup', {})
-  assert.equal(root.style.left, '490px', '拖动没有把浮层挪过去')
-  assert.equal(root.style.top, '190px', '拖动没有把浮层挪过去')
-  assert.equal(storage.get('dsh-danmaku:pos:page'), '{"left":490,"top":190}', '拖动后的位置没有记进 localStorage')
-  ok('拖动 + 位置记忆')
+  assert.equal(root.style.right, '1090px', '拖动没有把浮层挪过去')
+  assert.equal(root.style.bottom, '670px', '拖动没有把浮层挪过去')
+  assert.equal(root.style.top, 'auto', '拖动之后还留着 top —— 那会让内容朝下长、工具行被顶出屏幕')
+  await flush()
+  const placeCalls = fakeFetch.calls.filter((call) => call.url.includes('/place'))
+  assert.equal(placeCalls.length, 1, '拖动结束没有把位置报给 host（另一个宿主就同步不到）')
+  assert.ok(placeCalls[0].body.includes('1090'), '/place 的 body 里没有新位置')
+  ok('拖动 → right/bottom + 报给 host')
 
   /* 会话菜单：开关、列表、选择、点外面收起。 */
   const menuButton = findByTitle(root, '选择要看哪个会话')
@@ -709,14 +773,14 @@ async function checkFrontend() {
   walk(menu, (node) => {
     if (node.classList.contains('dshd-item')) items.push(node)
   })
-  assert.equal(items.length, 3, `菜单应当是"自动跟随 + 两个会话"，实际 ${String(items.length)} 项`)
-  assert.ok(items[0].textContent.includes('自动跟随'), '第一项不是自动跟随')
-  assert.equal(items[2].title, 'session-b', '完整 id 应当挂在 title 上')
-  assert.ok(items[2].textContent.includes('session-'), '没有标题的会话应当退回短 id 而不是空行')
-  ok('☰ 打开菜单：自动跟随 + 会话（没标题就退回短 id）')
+  assert.equal(items.length, 2, `菜单里应当是两个会话（没有"自动跟随"这一项），实际 ${String(items.length)} 项`)
+  assert.equal(items[0].title, 'session-a', '第一项应当是最近说话的那个会话')
+  assert.equal(items[1].title, 'session-b', '完整 id 应当挂在 title 上')
+  assert.ok(items[1].textContent.includes('session-'), '没有标题的会话应当退回短 id 而不是空行')
+  ok('☰ 打开菜单：列出会话（没标题退回短 id，且没有"自动跟随"项）')
 
   const beforeFocus = fakeFetch.calls.filter((call) => call.url.includes('/focus')).length
-  items[2].dispatch('click')
+  items[1].dispatch('click')
   await flush()
   await flush()
   const focusCalls = fakeFetch.calls.filter((call) => call.url.includes('/focus'))

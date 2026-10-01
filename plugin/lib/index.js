@@ -17,11 +17,12 @@
  *     GET  /dsh-danmaku/v3/stream       SSE，实时事件
  *     GET  /dsh-danmaku/v3/recent       JSON 回填（含「现在是哪个会话」）
  *     GET  /dsh-danmaku/v3/sessions     会话列表（浮层上那个会话选择菜单的数据源）
- *     POST /dsh-danmaku/v3/focus        钉住某个会话看；空串 = 恢复自动跟随
+ *     POST /dsh-danmaku/v3/focus        选定要看哪个会话
+ *     POST /dsh-danmaku/v3/place        记下浮层的位置（距视口右下角多少像素）
  *     POST /dsh-danmaku/v3/send         把一句话发进会话（前端那条折叠输入框用）
- *     GET  /dsh-danmaku/v3/status       诊断：活跃会话、会话表、客户端数、前端文件状态
+ *     GET  /dsh-danmaku/v3/status       诊断：活跃会话、会话表、位置、客户端数、前端文件状态
  *
- * 每条路由都走 `ctx.effect`，所以插件停用/更新时七条一起撤掉。留下一条还在应答的路由，
+ * 每条路由都走 `ctx.effect`，所以插件停用/更新时八条一起撤掉。留下一条还在应答的路由，
  * 就是一个插件"该走了却还在说话"的样子。
  */
 import { readFileSync, statSync } from 'node:fs'
@@ -304,6 +305,40 @@ function turnEndSentence(reason) {
 }
 
 /**
+ * 把 Markdown 标记去掉，只留字。
+ *
+ * 气泡**不渲染** Markdown —— 它是一个"扫一眼"的窗口，不是阅读器。既然不渲染，`**加粗**`、
+ * 反引号、`##` 这些照原样显示出来就只剩噪音：一半的字符是语法，读起来比正文还费劲。
+ * 所以在这里把标记洗掉、把文字留下。
+ *
+ * 清洗放在 host 这一侧，两个宿主才会长得一样。`detail` **不受影响** —— 点开的全文仍然给原文，
+ * 那里是给人读完整内容和复制的，不该被改写。
+ */
+function plainText(input) {
+  let text = String(input ?? '')
+  /* 围栏代码块：去掉围栏，内容压成一行（气泡里没有放多行代码的地方）。 */
+  text = text.replace(/```[a-zA-Z0-9+#-]*\n?([\s\S]*?)```/g, (_all, body) => String(body).replace(/\s+/g, ' '))
+  /* 行内代码、图片、链接：留文字，丢语法。 */
+  text = text.replace(/`([^`]+)`/g, '$1')
+  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+  text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+  text = text.replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1')
+  /* 加粗 / 删除线：成对才算，免得把单独的符号当语法吃掉。 */
+  text = text.replace(/\*\*([^*]+)\*\*/g, '$1')
+  text = text.replace(/__([^_]+)__/g, '$1')
+  text = text.replace(/~~([^~]+)~~/g, '$1')
+  /* 行首的标题、引用、列表符号。 */
+  text = text.replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, '')
+  text = text.replace(/^[ \t]{0,3}>[ \t]?/gm, '')
+  text = text.replace(/^[ \t]{0,3}(?:[-*+]|\d+\.)[ \t]+/gm, '')
+  /* 表格分隔行与水平线：整行没有信息量的那种。 */
+  text = text.replace(/^[ \t]{0,3}\|?[ \t]*:?-{3,}:?[ \t]*(\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*$/gm, ' ')
+  text = text.replace(/^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, ' ')
+  /* 最后压平空白：气泡里的一串空行只会把它撑高。 */
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
  * 把一条原始事件读成 `{ kind, text, detail }`，读不出句子就返回 null。
  *
  * `text` 是气泡上那一行，`detail` 是点开之后看的全文。
@@ -332,19 +367,15 @@ function interpret(event) {
     return { kind, text: turnEndSentence(String(event.reason ?? '')), detail: String(event.detail ?? '') }
   }
 
-  if (kind === 'user') {
-    const text = String(event.text ?? '')
-    return { kind, text: `你说：${shorten(text, 260)}`, detail: text }
-  }
-
-  if (kind === 'assistant') {
-    const text = String(event.text ?? '')
-    return { kind, text: `我说：${shorten(text, 260)}`, detail: text }
-  }
-
-  if (kind === 'assistant:final') {
-    const text = String(event.text ?? '')
-    return { kind, text: `我说：${shorten(text, 260)}`, detail: text }
+  /*
+   * 说的话：气泡上只留内容本身。
+   *
+   * 以前这里带着「我说：」「你说：」的前缀 —— 而气泡的颜色和位置已经在说是谁了，前缀除了占地方
+   * 没有别的用处。`detail` 仍然是原文（不清洗）：点开是给人读全文和复制的。
+   */
+  if (kind === 'user' || kind === 'assistant' || kind === 'assistant:final') {
+    const raw = String(event.text ?? '')
+    return { kind, text: shorten(plainText(raw), 260), detail: raw }
   }
 
   if (kind === 'session:switch') {
@@ -413,8 +444,16 @@ export default {
       const knownSessions = new Map()
       /** 会话 id -> Session 对象。`sessionTitle.get()` 要的是对象，不是 id。 */
       const sessionObjects = new Map()
-      /** 手动钉住的会话。空串 = 自动跟随最活跃的那个。 */
+      /** 用户选定的会话。空串 = 还没选过（第一条带会话的事件会落位一次）。 */
       let focusedSession = ''
+      /**
+       * 浮层的位置：距视口右下角各多少像素。
+       *
+       * 放在 host 而不是各自的 localStorage：DSH 页面和桌面 overlay 是两份前端，位置本来就得同步。
+       * 更要紧的是**只有"贴着右下角"这种写法**才保证"按钮行固定、内容朝上长"—— 用 left/top 定位时
+       * 内容一长就往下长，按钮行直接被顶出屏幕（主人报的第 4 条就是这个）。
+       */
+      let placement = { right: 18, bottom: 128 }
       /** 会话 id -> 这一轮最后一段助手文本，用来判断「结束但没有回复」。 */
       const lastAnswer = new Map()
       /** 只在诊断里用：一共播出去多少条。 */
@@ -498,17 +537,49 @@ export default {
         }
       }
 
-      /** 菜单里的排序键：最近说过话的排前面。 */
+      /**
+       * 菜单里的候选会话：**所有 root 会话**，最近说过话的排前面。
+       *
+       * 只列"见过事件的会话"是不够的 —— 要的是"任意选一个会话看"，包括本进程还没见它说过话的
+       * 那些（重启之后，之前活跃过的会话就属于这一类）。它们没有时间也没有最后一句，于是排在后面、
+       * 显示成"没有动静"，但仍然可以选：选过去之后，它一说话气泡就会长出来。
+       */
       function sessionList() {
-        const list = [...knownSessions.values()]
+        const rows = new Map()
+        for (const entry of knownSessions.values()) {
+          rows.set(entry.id, {
+            id: entry.id,
+            title: entry.title,
+            lastAt: entry.lastAt,
+            lastText: entry.lastText,
+            events: entry.events,
+          })
+        }
+
+        try {
+          const agents = ctx.get('agents')
+          const roots =
+            agents !== undefined && agents !== null && typeof agents.roots === 'function' ? agents.roots() : []
+          if (Array.isArray(roots)) {
+            for (const agent of roots) {
+              const id = agent?.id
+              if (typeof id !== 'string' || id === '' || rows.has(id)) continue
+              /*
+               * Agent 身上如果挂着 Session，标题就问得出来（`sessionTitle.get()` 要的是对象，
+               * 不是 id）。拿不到也没关系：菜单退回 id 前八位，总比这个会话压根不出现强。
+               */
+              const session = agent?.session
+              if (session !== undefined && session !== null) rememberSessionObject(id, session)
+              rows.set(id, { id, title: titleOf(id, ''), lastAt: 0, lastText: '', events: 0 })
+            }
+          }
+        } catch {
+          /* 少列几条不是故障：菜单还能用，只是安静的那些会话暂时看不见。 */
+        }
+
+        const list = [...rows.values()]
         list.sort((left, right) => right.lastAt - left.lastAt)
-        return list.map((entry) => ({
-          id: entry.id,
-          title: entry.title,
-          lastAt: entry.lastAt,
-          lastText: entry.lastText,
-          events: entry.events,
-        }))
+        return list
       }
 
       function rememberRecent(event) {
@@ -598,12 +669,12 @@ export default {
       /**
        * 播一条事件，并维护"现在是哪个会话"。
        *
-       * 会话归属四条规则，按顺序：
+       * 规则三条，按顺序：
        *
        *   1. **子代理的会话不播**（`isRootSession`）——主会话派一个子代理出去，画面不该跟着它走；
-       *   2. **手动钉住的会话优先**——用户从菜单里选了谁就是谁，用户消息也不再自动把画面带走；
-       *   3. **用户消息是锚**——没钉住时，用户在哪个会话里发话，就等于告诉我们他在看谁；
-       *   4. 没有锚时（刚启动、或者这一轮还没有用户消息）用第一条带会话的事件落位。
+       *   2. **选定的会话说了算**——用户从菜单里点了谁就是谁。**没有自动跟随**：别人说话不会把
+       *      画面换走（这是主人明确要的：别在我看的时候把内容换掉）；
+       *   3. **还没选过就落位一次**——落到第一条带会话的事件上，之后一直钉在那儿。
        *
        * 而且不管播不播，**每个 root 会话的活动都要记进 `knownSessions`**：会话菜单要能显示
        * "另一个会话最后在干什么" —— 那正是用户决定要不要切过去看的东西。先按规则过滤再记账的话，
@@ -634,30 +705,24 @@ export default {
         const spoken = interpret(event)
         rememberSession(sessionId, spoken === null ? '' : spoken.text, title)
 
-        if (focusedSession !== '') {
-          if (sessionId !== focusedSession) return
+        if (focusedSession === '') {
+          focusedSession = sessionId
           activeSession = sessionId
           activeTitle = knownSessions.get(sessionId)?.title || title
-        } else if (event.anchor === true) {
-          if (activeSession !== sessionId) {
-            activeSession = sessionId
-            activeTitle = knownSessions.get(sessionId)?.title || title
-            push({
-              kind: 'session:switch',
-              text: `跟着你切到 ${sessionLabel(sessionId, activeTitle)}`,
-              detail: '',
-              session: sessionId,
-              sessionTitle: activeTitle,
-              at: Date.now(),
-            })
-          } else {
-            activeTitle = knownSessions.get(sessionId)?.title || title
-          }
-        } else if (activeSession === '') {
-          activeSession = sessionId
-          activeTitle = knownSessions.get(sessionId)?.title || title
-        } else if (activeSession !== sessionId) {
+          push({
+            kind: 'session:switch',
+            text: `现在看 ${sessionLabel(sessionId, activeTitle)}`,
+            detail: '',
+            session: sessionId,
+            sessionTitle: activeTitle,
+            at: Date.now(),
+          })
+        } else if (sessionId !== focusedSession) {
+          /* 选了别的会话：它的事件不播（但仍然记进了会话表，菜单里看得到它在说什么）。 */
           return
+        } else {
+          activeSession = sessionId
+          activeTitle = knownSessions.get(sessionId)?.title || title
         }
 
         if (spoken === null) return
@@ -852,10 +917,11 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v3',
+                build: 'v4',
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,
+                place: placement,
                 sessionCount: knownSessions.size,
                 sessions: sessionList(),
                 events: published,
@@ -891,6 +957,7 @@ export default {
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,
+                place: placement,
                 events: eventsForBackfill(),
               })
             },
@@ -975,6 +1042,50 @@ export default {
             },
           }),
         'dsh-danmaku:route:focus',
+      )
+
+      /*
+       * 浮层的位置。
+       *
+       * 由 host 保管的理由和 focus 一样：两个宿主得看同一个答案。而且这里**只收 right/bottom**，
+       * 不收 left/top —— 位置一旦用"距顶部多少"来表达，内容一变长就会把工具行推出屏幕。
+       */
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/place`,
+            handler: async (req, res) => {
+              if (req.method !== 'POST') {
+                sendJson(res, 405, { ok: false, error: 'POST only' })
+                return
+              }
+              const body = await readBody(req)
+              const right = Number(body?.right)
+              const bottom = Number(body?.bottom)
+              if (!Number.isFinite(right) || !Number.isFinite(bottom) || right < 0 || bottom < 0) {
+                sendJson(res, 400, { ok: false, error: 'right / bottom 要是非负数' })
+                return
+              }
+              placement = { right: Math.round(right), bottom: Math.round(bottom) }
+              /*
+               * 广播给所有客户端：拖一边，另一边也要跟着挪。前端收到 kind 为 'place' 的事件只挪
+               * 位置、不长气泡（它没有 text，addBubble 会跳过）。
+               */
+              push({
+                kind: 'place',
+                text: '',
+                detail: '',
+                session: '',
+                sessionTitle: '',
+                right: placement.right,
+                bottom: placement.bottom,
+                at: Date.now(),
+              })
+              sendJson(res, 200, { ok: true, right: placement.right, bottom: placement.bottom })
+            },
+          }),
+        'dsh-danmaku:route:place',
       )
 
       ctx.effect(

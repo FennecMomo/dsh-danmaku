@@ -19,10 +19,15 @@
  *     只有真正可点的那些小方块（气泡、按钮）才 `pointer-events: auto`。
  *
  * 违反它的后果不是"点不到"，而是"整块桌面点不动"——那正是 overlay 那层费了很大劲避开的事。
+ * 唯一的例外是拖动期间那层透明遮罩（`.dshd-shield`），它故意铺满视口且可交互，理由见下。
  *
- * 另一个必须记住的边界：overlay 里**不要做拖动**。指针一旦离开可交互元素，窗口就恢复穿透，
- * mousemove 立刻断掉，拖动会半途而废。桌面上的落点本来就该固定在右下角，所以那边不做拖动；
- * DSH 页面里（不是 overlay）才可以拖，位置记在 localStorage 里。
+ * 位置与拖动：
+ *
+ *   - 位置由 **host** 保管（两个宿主读同一份），而且**永远只用 right/bottom 贴住右下角**。
+ *     用 left/top 就等于把"顶边"钉死，内容一长工具行就会被推出屏幕 —— 而工具行恰恰是唯一
+ *     能把它拖回来的东西。固定底边，内容才会朝上长。
+ *   - overlay 里**也能拖**：拖动期间铺一层满视口的透明遮罩，让外壳的 `elementFromPoint` 判定
+ *     在整段拖动里都命中"可交互"，穿透不会在中途打开把 `mousemove` 掐断（见 startDrag）。
  */
 ;(function () {
   'use strict'
@@ -37,28 +42,36 @@
   /** 启动时回填几条。故意很小：把整个会话回放出来是一堵没用的历史墙。 */
   var BACKFILL = 3
   var IS_OVERLAY = location.pathname.indexOf('/dsh-overlay') === 0
-  var POS_KEY = 'dsh-danmaku:pos:' + (IS_OVERLAY ? 'overlay' : 'page')
   var STYLE_ID = 'dsh-danmaku-style'
   var ROOT_ID = 'dsh-danmaku-root'
+  /** 位置由 host 保管（两个宿主共用一份），这里只是本地的当前值。 */
+  var placement = { right: 18, bottom: 128 }
 
-  /* 三种红/蓝/灰只做一件事：一眼分出"成了""错了""中性"。语义靠句子本身。 */
+  /*
+   * 两族颜色，故意拉开距离：
+   *
+   *   - **动作**（工具、一轮结束、会话切换）：低饱和的冷灰蓝、底色压暗。它们是"发生了什么"；
+   *   - **说话**（你、我、最终回复）：彩色的边框 + 明显更亮的底色。它们是"谁说了什么"。
+   *
+   * 主人要的是"一眼分得开"，所以差别不能只有边框颜色深浅那么一点 —— 底色也一起分开。
+   */
   var ACCENT = {
-    'tool:ok': '#5B93EE',
-    'tool:error': '#E0646F',
-    'turn:end': '#6B7684',
-    'session:switch': '#6B7684',
-    user: '#5FB8C9',
+    'tool:ok': '#3F5A7A',
+    'tool:error': '#8C4A52',
+    'turn:end': '#4A545F',
+    'session:switch': '#4A545F',
+    user: '#4FB3C9',
     assistant: '#8E7BE8',
     'assistant:final': '#E8B45C',
   }
   var FILL = {
-    'tool:ok': '#11151B',
-    'tool:error': '#1D1114',
-    'turn:end': '#14171B',
-    'session:switch': '#14171B',
-    user: '#101C2A',
-    assistant: '#16121F',
-    'assistant:final': '#1C1710',
+    'tool:ok': '#0F141B',
+    'tool:error': '#1A1013',
+    'turn:end': '#12161C',
+    'session:switch': '#12161C',
+    user: '#12303C',
+    assistant: '#1E1836',
+    'assistant:final': '#2C2312',
   }
 
   /* -- 样式 ------------------------------------------------------------------ */
@@ -106,6 +119,15 @@
     'white-space:pre-wrap;word-break:break-word;font-family:"Cascadia Mono",Consolas,"Microsoft YaHei UI",monospace}',
     '.dshd-note{pointer-events:none;color:#8B98A5;font-size:11px;min-height:14px;text-align:right}',
     /*
+     * 拖动期间的透明遮罩：铺满视口、可交互。
+     *
+     * overlay 那层窗口靠 elementFromPoint 判断"指针下有没有可交互元素"，没有就把窗口恢复成
+     * 鼠标穿透。浮层容器平时是 pointer-events:none，于是指针一离开把手就被判成"空白"
+     * → 穿透打开 → mousemove 断掉，拖动半途而废。这一层让整段拖动都命中"可交互"。
+     */
+    '.dshd-shield{position:fixed;left:0;top:0;right:0;bottom:0;display:none;pointer-events:auto}',
+    '#' + ROOT_ID + '.dshd-dragging .dshd-shield{display:block}',
+    /*
      * 会话菜单：绝对定位贴着工具行**往上**弹。
      * 浮层永远待在屏幕下半部分，往下弹会直接出屏。
      */
@@ -132,24 +154,40 @@
     return node
   }
 
-  function readPosition() {
-    try {
-      var raw = window.localStorage.getItem(POS_KEY)
-      if (raw === null || raw === '') return null
-      var parsed = JSON.parse(raw)
-      if (parsed && typeof parsed.left === 'number' && typeof parsed.top === 'number') return parsed
-    } catch (error) {
-      /* 隐私模式 / 存储被禁：没有记忆位置也不是故障。 */
-    }
-    return null
+  /**
+   * 把浮层挪到 host 记下的位置。
+   *
+   * **永远只用 right/bottom 贴住右下角。** 用 left/top 就等于把"顶边"钉死，内容一长就往
+   * 下长，工具行被推出屏幕 —— 而工具行恰恰是唯一能把它拖回来的东西（主人报的第 4 条）。
+   * 朝哪边延伸由"哪条边被固定"决定：固定底边，就朝上长。
+   */
+  function applyPlacement(next) {
+    if (next === null || next === undefined) return
+    var right = Number(next.right)
+    var bottom = Number(next.bottom)
+    if (!isFinite(right) || !isFinite(bottom) || right < 0 || bottom < 0) return
+    placement = { right: right, bottom: bottom }
+    if (root === null) return
+    root.style.left = 'auto'
+    root.style.top = 'auto'
+    root.style.right = right + 'px'
+    root.style.bottom = bottom + 'px'
   }
 
-  function savePosition(position) {
-    try {
-      window.localStorage.setItem(POS_KEY, JSON.stringify(position))
-    } catch (error) {
-      /* 同上。 */
-    }
+  /** 把新位置报给 host —— 它会广播给另一个宿主，两边的浮层才不会各待各的。 */
+  function postPlace(next) {
+    window
+      .fetch(API + '/place', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(next),
+      })
+      .then(function (response) {
+        return response.json()
+      })
+      .catch(function () {
+        /* 位置没记上不是故障：这一次拖动照样有效，下次再拖会再报一次。 */
+      })
   }
 
   /* -- 浮层 ------------------------------------------------------------------ */
@@ -210,8 +248,8 @@
     composer.appendChild(sendButton)
 
     var bar = element('div', 'dshd-bar')
-    var grip = element('div', 'dshd-grip', IS_OVERLAY ? '' : '⣿')
-    grip.title = IS_OVERLAY ? '桌面 overlay 里的位置固定在工作区右下角' : '按住拖动，位置会记住'
+    var grip = element('div', 'dshd-grip', '⣿')
+    grip.title = '按住拖动，位置两个窗口共用'
     menuButton = element('button', 'dshd-btn', '☰')
     menuButton.title = '选择要看哪个会话的弹幕'
     var eye = element('button', 'dshd-btn', '◐')
@@ -234,21 +272,16 @@
     root.appendChild(bar)
     root.appendChild(note)
     root.appendChild(menu)
+    /* 拖动遮罩：平时 display:none，只有加上 .dshd-dragging 时才铺开（见 startDrag）。 */
+    root.appendChild(element('div', 'dshd-shield'))
     document.body.appendChild(root)
 
-    /* 位置：DSH 页面里恢复上次拖到的地方；overlay 里固定右下角（那里拖动会断，见文件头）。 */
-    if (!IS_OVERLAY) {
-      var saved = readPosition()
-      if (saved !== null) {
-        root.style.left = saved.left + 'px'
-        root.style.top = saved.top + 'px'
-        root.style.right = 'auto'
-        root.style.bottom = 'auto'
-      }
-      grip.addEventListener('mousedown', startDrag)
-    } else {
-      grip.style.cursor = 'default'
-    }
+    /*
+     * 位置：host 记着的那一份（两个宿主共用）。grip 在**两边**都能拖 —— overlay 里靠
+     * `.dshd-shield` 把穿透判定按住不放，见 startDrag。
+     */
+    applyPlacement(placement)
+    grip.addEventListener('mousedown', startDrag)
 
     menuButton.addEventListener('click', toggleMenu)
 
@@ -326,26 +359,44 @@
   function startDrag(event) {
     if (event.button !== 0) return
     var rect = root.getBoundingClientRect()
-    var offsetX = event.clientX - rect.left
-    var offsetY = event.clientY - rect.top
+    /* 抓住的是"右下角"：指针距 root 右边缘、下边缘各多远，整段拖动里保持不变。 */
+    var offsetRight = rect.right - event.clientX
+    var offsetBottom = rect.bottom - event.clientY
     var latest = null
 
     function move(moveEvent) {
-      var left = Math.max(0, Math.min(moveEvent.clientX - offsetX, window.innerWidth - rect.width))
-      var top = Math.max(0, Math.min(moveEvent.clientY - offsetY, window.innerHeight - rect.height))
-      root.style.left = left + 'px'
-      root.style.top = top + 'px'
-      root.style.right = 'auto'
-      root.style.bottom = 'auto'
-      latest = { left: Math.round(left), top: Math.round(top) }
+      /* 夹在视口里，但至少留 40px 能看见、能抓住，免得拖出去再也点不到。 */
+      var right = Math.max(
+        0,
+        Math.min(window.innerWidth - (moveEvent.clientX + offsetRight), Math.max(0, window.innerWidth - 40)),
+      )
+      var bottom = Math.max(
+        0,
+        Math.min(window.innerHeight - (moveEvent.clientY + offsetBottom), Math.max(0, window.innerHeight - 40)),
+      )
+      root.style.left = 'auto'
+      root.style.top = 'auto'
+      root.style.right = right + 'px'
+      root.style.bottom = bottom + 'px'
+      latest = { right: Math.round(right), bottom: Math.round(bottom) }
     }
 
     function up() {
       document.removeEventListener('mousemove', move)
       document.removeEventListener('mouseup', up)
-      if (latest !== null) savePosition(latest)
+      root.classList.remove('dshd-dragging')
+      if (latest !== null) postPlace(latest)
     }
 
+    /*
+     * 拖动期间铺一层透明遮罩（`.dshd-shield`）。
+     *
+     * 这不是为了好看：在 overlay 那层窗口里，外壳每 40ms 用 `elementFromPoint` 判断"指针下有没有
+     * 可交互元素"，没有就把窗口恢复成鼠标穿透。浮层容器平时是 `pointer-events:none`，于是指针
+     * 一离开把手就被判成空白 → 穿透打开 → `mousemove` 断掉，拖动半途而废。遮罩铺满视口又
+     * 可交互，整段拖动里判定都命中它 —— 这就是 overlay 里终于拖得动的原因。
+     */
+    root.classList.add('dshd-dragging')
     document.addEventListener('mousemove', move)
     document.addEventListener('mouseup', up)
     event.preventDefault()
@@ -476,18 +527,14 @@
   function renderMenu() {
     if (menu === null) return
     menu.textContent = ''
-    menu.appendChild(element('div', 'dshd-menu-head', '弹幕跟着哪个会话'))
+    menu.appendChild(element('div', 'dshd-menu-head', '看哪个会话的弹幕'))
 
-    var auto = element('button', 'dshd-item' + (focusedSession === '' ? ' dshd-current' : ''))
-    auto.appendChild(element('div', 'dshd-item-title', '自动跟随'))
-    auto.appendChild(element('div', 'dshd-item-sub', '谁在说话就看谁'))
-    auto.addEventListener('click', function () {
-      chooseSession('')
-    })
-    menu.appendChild(auto)
-
+    /*
+     * 这里**没有"自动跟随"这一项**：主人要的是"选定一个会话就别再自己换"。
+     * 没选过之前 host 会落位一次（落到第一个开口的会话），那之后画面就固定在那儿了。
+     */
     if (sessionRows.length === 0) {
-      menu.appendChild(element('div', 'dshd-empty', '还没有别的会话在说话'))
+      menu.appendChild(element('div', 'dshd-empty', '还没有会话可选（等它说句话）'))
       return
     }
 
@@ -496,10 +543,13 @@
       var item = element('button', 'dshd-item' + (current ? ' dshd-current' : ''))
       /* 有标题就用标题，没有就退回 id 前几位——菜单里最不该出现的是一排"什么都没写"。 */
       item.appendChild(element('div', 'dshd-item-title', row.title || row.id.slice(0, 8) + '…'))
-      var parts = []
-      if (row.lastAt) parts.push(relativeTime(row.lastAt))
+      /*
+       * 副行：多久之前 + 最后一句。本进程还没见它说过话的会话（例如重启前活跃过的那些）
+       * 没有这两样，写"没有动静"而不是留空 —— 空行看起来像渲染坏了。
+       */
+      var parts = [row.lastAt ? relativeTime(row.lastAt) : '没有动静']
       if (row.lastText) parts.push(row.lastText)
-      item.appendChild(element('div', 'dshd-item-sub', parts.join(' · ') || '（还没有动静）'))
+      item.appendChild(element('div', 'dshd-item-sub', parts.join(' · ')))
       /* 完整 id 挂在 title 上：短 id 是用来认人的，要复制/核对时还得看全的。 */
       item.title = row.id
       item.addEventListener('click', function () {
@@ -580,9 +630,14 @@
 
   function handle(event) {
     if (event === null || event === undefined) return
+    if (event.kind === 'place') {
+      /* 另一个窗口把浮层拖走了：跟着挪，但**不长气泡** —— 它是位置，不是"发生了什么"。 */
+      applyPlacement({ right: event.right, bottom: event.bottom })
+      return
+    }
     if (typeof event.session === 'string' && event.session !== '') activeSession = event.session
     if (event.kind === 'session:switch') {
-      /* 跟着人切会话：屏幕上的旧气泡是上一个会话的，留着就是错的。 */
+      /* 换会话了：屏幕上的旧气泡是上一个会话的，留着就是错的。 */
       clearBubbles()
       closeDetail()
     }
@@ -601,11 +656,13 @@
       .then(function (data) {
         if (data === null || data === undefined) return
         if (typeof data.active === 'string' && data.active !== '') activeSession = data.active
-        /* 回填顺带把"现在钉着谁"同步过来：刷新之后按钮的状态不该靠猜。 */
+        /* 回填顺带把"现在选的是谁"同步过来：刷新之后按钮的状态不该靠猜。 */
         if (typeof data.focused === 'string') {
           focusedSession = data.focused
           updateMenuButton()
         }
+        /* 位置也由 host 保管：两个宿主共用一份，所以拖一边另一边会跟着走。 */
+        if (data.place !== undefined && data.place !== null) applyPlacement(data.place)
         var events = Array.isArray(data.events) ? data.events.slice(-BACKFILL) : []
         for (var index = 0; index < events.length; index += 1) addBubble(events[index])
         if (input !== null && activeSession !== '') input.placeholder = '发往 ' + activeSession.slice(0, 8) + '…'
