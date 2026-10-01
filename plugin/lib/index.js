@@ -385,11 +385,16 @@ function interpret(event) {
   return null
 }
 
-/** 会话名：有标题就用标题，没有就退回 id 前几位——两条路都不会让气泡空着。 */
+/**
+ * 会话名：有标题就用标题，没有就退回 id **尾部**。
+ *
+ * 尾部而不是头部：会话 id 全部以 `session-` 开头，取前八位每个会话都是同一串 "session-…"，
+ * 拿它认人等于没认。这一条是测试时在菜单上撞见的 —— 两个会话长得一模一样。
+ */
 function sessionLabel(sessionId, title) {
   if (typeof title === 'string' && title !== '') return shorten(title, 24)
   if (sessionId === '') return '当前会话'
-  return `${sessionId.slice(0, 8)}…`
+  return `…${sessionId.slice(-8)}`
 }
 
 // --------------------------------------------------------------------------- //
@@ -566,7 +571,7 @@ export default {
               if (typeof id !== 'string' || id === '' || rows.has(id)) continue
               /*
                * Agent 身上如果挂着 Session，标题就问得出来（`sessionTitle.get()` 要的是对象，
-               * 不是 id）。拿不到也没关系：菜单退回 id 前八位，总比这个会话压根不出现强。
+               * 不是 id）。拿不到也没关系：菜单退回 id 尾部八位，总比这个会话压根不出现强。
                */
               const session = agent?.session
               if (session !== undefined && session !== null) rememberSessionObject(id, session)

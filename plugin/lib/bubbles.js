@@ -541,8 +541,11 @@
     sessionRows.forEach(function (row) {
       var current = focusedSession === row.id
       var item = element('button', 'dshd-item' + (current ? ' dshd-current' : ''))
-      /* 有标题就用标题，没有就退回 id 前几位——菜单里最不该出现的是一排"什么都没写"。 */
-      item.appendChild(element('div', 'dshd-item-title', row.title || row.id.slice(0, 8) + '…'))
+      /*
+       * 有标题就用标题，没有就退回 id **尾部** —— 注意是尾部：所有会话 id 都以 `session-` 开头，
+       * 取前八位等于每个会话都显示成同一串 "session-…"，一点区分度都没有。
+       */
+      item.appendChild(element('div', 'dshd-item-title', row.title || '…' + row.id.slice(-8)))
       /*
        * 副行：多久之前 + 最后一句。本进程还没见它说过话的会话（例如重启前活跃过的那些）
        * 没有这两样，写"没有动静"而不是留空 —— 空行看起来像渲染坏了。
@@ -643,7 +646,8 @@
     }
     addBubble(event)
     if (input !== null && activeSession !== '') {
-      input.placeholder = '发往 ' + activeSession.slice(0, 8) + '…'
+      /* 同样取尾部：`session-` 那个前缀对认人毫无帮助。 */
+      input.placeholder = '发往 …' + activeSession.slice(-8)
     }
   }
 

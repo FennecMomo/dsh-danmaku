@@ -776,8 +776,8 @@ async function checkFrontend() {
   assert.equal(items.length, 2, `菜单里应当是两个会话（没有"自动跟随"这一项），实际 ${String(items.length)} 项`)
   assert.equal(items[0].title, 'session-a', '第一项应当是最近说话的那个会话')
   assert.equal(items[1].title, 'session-b', '完整 id 应当挂在 title 上')
-  assert.ok(items[1].textContent.includes('session-'), '没有标题的会话应当退回短 id 而不是空行')
-  ok('☰ 打开菜单：列出会话（没标题退回短 id，且没有"自动跟随"项）')
+  assert.ok(items[1].textContent.includes('ession-b'), '没有标题的会话应当退回 id 尾部而不是空行')
+  ok('☰ 打开菜单：列出会话（没标题退回 id 尾部，且没有"自动跟随"项）')
 
   const beforeFocus = fakeFetch.calls.filter((call) => call.url.includes('/focus')).length
   items[1].dispatch('click')

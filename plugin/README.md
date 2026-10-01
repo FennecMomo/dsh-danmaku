@@ -91,7 +91,7 @@ s.onerror=function(){};d.appendChild(s)}catch(e){}})()</script>
   也列出来，显示成"没有动静"，选过去之后它一开口气泡就会长出来。
 - **标题是向 `sessionTitle` 服务问来的**（`get(session)`，同步），用 `ctx.get('sessionTitle')`
   而不是 `ctx.sessionTitle`：标题只是锦上添花，不值得为它把整个半边变成硬依赖（第 1 条坑的同一道理）。
-  取不到就退回 id 前八位，绝不显示空行。
+  取不到就退回 id **尾部**八位（`session-` 前缀人人都有，取头部等于没显示），绝不显示空行。
 
 ---
 
