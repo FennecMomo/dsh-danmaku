@@ -1,0 +1,16 @@
+{
+  "alpha": 60,
+  "width": 360,
+  "height": 240,
+  "x": null,
+  "y": null,
+  "clickThrough": true,
+  "maxBubbles": 6,
+  "backfillBubbles": 3,
+  "maxHeight": 520,
+  "maxBubbleWidth": 300,
+  "idleExitSeconds": 900,
+  "pollClicks": true,
+  "showControls": true,
+  "dimAlpha": 128
+}

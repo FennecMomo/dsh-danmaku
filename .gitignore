@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 凭证。这个仓库会推到 GitHub，所以下面这些名字绝不能提交：一把私钥进了公开远端
+# 就收不回来了，而多忽略一个文件（误判）没有任何代价。
+# ─────────────────────────────────────────────────────────────────────────────
+*.local.json
+*.local
+.env
+.env.*
+!.env.example
+
+# 其他常见的凭证文件名。目前这个仓库没有用到，列在这里是为了让「顺手丢进来的
+# 一把钥匙」不可能被提交。
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# 依赖
+node_modules/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+
+# 弹幕面板的运行时状态。settings.json 故意不忽略 —— 它保存的是调好的外观
+# （背景透明度、尺寸、气泡上限、位置），把它带到另一台机器正是这个仓库的用意。
+danmaku/.panel-startup.log
+danmaku/.panel-status.json
+danmaku/.panel-done.json
+danmaku/.panel-error.log
+danmaku/.panel-stop
+danmaku/.panel-command
+danmaku/logs/
+danmaku/probe-*.png
+danmaku/compare-*.png
+
+# 提交信息暂存文件（命令行没法传 heredoc 时用的）
+.git-commit-msg.tmp

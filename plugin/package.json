@@ -1,0 +1,26 @@
+{
+  "name": "dsh-plugin-danmaku",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Per-session danmaku overlay control: a session-header button that opens, closes and reports a transparent bubble window driven by this session's events",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "external": [
+        "react",
+        "react/jsx-runtime"
+      ]
+    }
+  }
+}
