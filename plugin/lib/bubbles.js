@@ -37,10 +37,14 @@
   window.__dshDanmakuLoaded = true
 
   var API = '/dsh-danmaku/v3'
-  /** 同时可见的气泡数。旧的在顶上被挤掉——这是一个"正在发生什么"的窗口，不是历史记录。 */
-  var MAX_BUBBLES = 6
-  /** 启动时回填几条。故意很小：把整个会话回放出来是一堵没用的历史墙。 */
-  var BACKFILL = 3
+  /*
+   * 栈里最多留多少颗气泡 —— 与 host 那边每个会话的队列上限（`RECENT_PER_SESSION`）一致。
+   *
+   * 以前是 6，而且切会话时清空、只回填 3 条：于是"上一个会话刚才说了什么"永远找不回来
+   * （主人报的正是这个）。现在每个会话的气泡都在 host 各自攒着（各 30 条），切过去就把那 30 条
+   * 按顺序铺出来；一屏放不下就滚，而不是丢掉。
+   */
+  var MAX_BUBBLES = 30
   var IS_OVERLAY = location.pathname.indexOf('/dsh-overlay') === 0
   var STYLE_ID = 'dsh-danmaku-style'
   var ROOT_ID = 'dsh-danmaku-root'
@@ -112,7 +116,23 @@
     'border-left:5px solid transparent;border-right:5px solid transparent;border-top:7px solid var(--dshd-fill)}',
     '@keyframes dshd-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}',
     '.dshd-in{animation:dshd-in .16s ease-out}',
-    '.dshd-stack{display:flex;flex-direction:column;align-items:flex-end;gap:12px;width:100%;pointer-events:none}',
+    /*
+     * 气泡栈：限高、自己滚。
+     *
+     * 保持 `pointer-events: none` —— 滚轮在气泡上会冒泡到这个可滚动容器，所以照样能滚；
+     * 而容器整块矩形不会把桌面点击吃掉（那正是 overlay 那层费很大劲避免的事）。
+     * 真正的滚动条是右边那条自己画的窄轨，理由见 build() 里的注释。
+     */
+    '.dshd-scroll{position:relative;width:100%;max-height:52vh}',
+    '.dshd-stack{display:flex;flex-direction:column;align-items:flex-end;gap:12px;width:100%;',
+    'max-height:52vh;overflow-y:auto;overflow-x:hidden;padding-right:10px;box-sizing:border-box;pointer-events:none}',
+    /* 原生滚动条藏掉：容器 pointer-events:none，它拖不动，留着只会误导。 */
+    '.dshd-stack::-webkit-scrollbar{width:0;height:0}',
+    '.dshd-rail{display:none;position:absolute;top:0;right:0;width:8px;height:100%;',
+    'pointer-events:auto;border-radius:4px;background:rgba(255,255,255,.05)}',
+    '.dshd-scroll.dshd-has .dshd-rail{display:block}',
+    '.dshd-thumb{position:absolute;right:0;width:8px;border-radius:4px;background:rgba(255,255,255,.22)}',
+    '.dshd-rail:hover .dshd-thumb{background:rgba(255,255,255,.38)}',
     /* 工具行：拖动把手 + 两个按钮。 */
     '.dshd-bar{pointer-events:auto;display:flex;align-items:center;gap:6px;padding:2px 0;user-select:none}',
     '.dshd-grip{color:#5C6672;font-size:11px;letter-spacing:2px;cursor:move;padding:0 2px}',
@@ -396,6 +416,10 @@
 
   var root = null
   var stack = null
+  /** 包着气泡栈的滚动容器，以及它右侧那条自己画的滚动条（原生那条在 overlay 里拖不动）。 */
+  var scrollBox = null
+  var rail = null
+  var thumb = null
   var detailBox = null
   var detailBody = null
   var detailTitle = null
@@ -439,7 +463,21 @@
     detailBox.appendChild(header)
     detailBox.appendChild(detailBody)
 
+    /*
+     * 气泡栈外面包一层滚动容器，右侧是自己画的滚动条。
+     *
+     * 为什么不用原生那条：容器必须是 `pointer-events: none`（否则它整块矩形会把桌面点击全吃掉，
+     * 正是 overlay 那层费很大劲避免的事），而 `pointer-events: none` 的元素**拖不动**自己的
+     * 滚动条。所以滚动条做成一个独立的、只有 8px 宽的窄条：它自己可交互，而滚轮照样能在气泡上
+     * 滚（滚轮事件会冒泡到可滚动的祖先）。
+     */
+    scrollBox = element('div', 'dshd-scroll')
     stack = element('div', 'dshd-stack')
+    rail = element('div', 'dshd-rail')
+    thumb = element('div', 'dshd-thumb')
+    rail.appendChild(thumb)
+    scrollBox.appendChild(stack)
+    scrollBox.appendChild(rail)
 
     composer = element('div', 'dshd-composer')
     input = element('input')
@@ -469,7 +507,7 @@
     note = element('div', 'dshd-note')
 
     root.appendChild(detailBox)
-    root.appendChild(stack)
+    root.appendChild(scrollBox)
     root.appendChild(composer)
     root.appendChild(bar)
     root.appendChild(note)
@@ -486,6 +524,10 @@
     grip.addEventListener('mousedown', startDrag)
 
     menuButton.addEventListener('click', toggleMenu)
+
+    /* 滚动：栈自己滚时同步滚动条；拖那条窄轨也能滚（在 overlay 里就靠它）。 */
+    stack.addEventListener('scroll', syncScrollbar)
+    rail.addEventListener('mousedown', startRailDrag)
 
     eye.addEventListener('click', function () {
       root.classList.toggle('dshd-hidden')
@@ -615,14 +657,100 @@
     }, 6000)
   }
 
+  /* -- 滚动 ------------------------------------------------------------------ */
+
+  /** 栈是不是已经贴底（留点容差，免得像素取整让它永远差一两个像素）。 */
+  function atBottom() {
+    if (stack === null) return true
+    return stack.scrollHeight - stack.scrollTop - stack.clientHeight < 24
+  }
+
+  /**
+   * 滚到底。
+   *
+   * `force` 用在"刚切过来 / 刚回填完"：那时应当直接看到最新的。平时（新气泡进来）只有用户
+   * 本来就贴底时才跟着滚 —— 他要是正在往上翻历史，一条新消息把他拽回底部是很讨厌的。
+   */
+  function scrollToBottom(force) {
+    if (stack === null) return
+    if (force === true || atBottom()) stack.scrollTop = stack.scrollHeight
+    syncScrollbar()
+  }
+
+  /** 把滑块摆到该在的位置；内容没超出一屏时整条藏起来。 */
+  function syncScrollbar() {
+    if (scrollBox === null || stack === null || rail === null || thumb === null) return
+    var view = stack.clientHeight
+    var full = stack.scrollHeight
+    var overflow = full - view
+    if (overflow <= 4) {
+      scrollBox.classList.remove('dshd-has')
+      return
+    }
+    scrollBox.classList.add('dshd-has')
+    var thumbHeight = Math.max(28, Math.round((view / full) * view))
+    var maxTop = Math.max(0, view - thumbHeight)
+    var ratio = overflow <= 0 ? 0 : Math.max(0, Math.min(1, stack.scrollTop / overflow))
+    thumb.style.height = thumbHeight + 'px'
+    thumb.style.top = Math.round(ratio * maxTop) + 'px'
+  }
+
+  /**
+   * 拖那条窄轨。
+   *
+   * 抓在滑块上就按位移滚，抓在轨道空白处就把滑块中心挪到指针那儿（和原生滚动条一个手感）。
+   * 拖动期间同样挂 `.dshd-dragging`：overlay 里的透明遮罩会把穿透按住，否则指针一离开这
+   * 8px 宽的小条，穿透打开、`mousemove` 就断了。
+   */
+  function startRailDrag(event) {
+    if (event.button !== 0 || stack === null || rail === null || thumb === null) return
+    var view = stack.clientHeight
+    var full = stack.scrollHeight
+    var maxScroll = full - view
+    if (maxScroll <= 0) return
+
+    var railTop = rail.getBoundingClientRect().top
+    var thumbHeight = thumb.getBoundingClientRect().height
+    var maxTop = Math.max(1, view - thumbHeight)
+    var grabbing = event.target === thumb
+    var startY = event.clientY
+    var startScroll = stack.scrollTop
+
+    function move(moveEvent) {
+      var next
+      if (grabbing === true) {
+        next = startScroll + ((moveEvent.clientY - startY) / maxTop) * maxScroll
+      } else {
+        next = ((moveEvent.clientY - railTop - thumbHeight / 2) / maxTop) * maxScroll
+      }
+      stack.scrollTop = Math.max(0, Math.min(maxScroll, next))
+      syncScrollbar()
+    }
+
+    function up() {
+      document.removeEventListener('mousemove', move)
+      document.removeEventListener('mouseup', up)
+      root.classList.remove('dshd-dragging')
+    }
+
+    root.classList.add('dshd-dragging')
+    document.addEventListener('mousemove', move)
+    document.addEventListener('mouseup', up)
+    event.preventDefault()
+  }
+
   /* -- 气泡 ------------------------------------------------------------------ */
 
   function clearBubbles() {
     if (stack === null) return
     stack.textContent = ''
+    /* 换会话时滚动位置也归零：新会话的气泡是从头铺的，不该继承上一个的位置。 */
+    stack.scrollTop = 0
+    if (scrollBox !== null) scrollBox.classList.remove('dshd-has')
   }
 
-  function addBubble(event) {
+  /** `quiet` 给批量回填用：先别急着滚，等整批铺完再滚一次（省掉几十次 layout）。 */
+  function addBubble(event, quiet) {
     if (event === null || event === undefined) return
     var text = typeof event.text === 'string' ? event.text : ''
     if (text === '') return
@@ -661,12 +789,20 @@
       })
     }
 
+    /*
+     * **先**记下"加之前贴不贴底"，再加。
+     *
+     * 反过来的话：appendChild 之后内容已经变高了，而 scrollTop 还是旧值，于是 `atBottom()`
+     * 必然算出"没贴底" —— 结果是新消息永远不跟着滚（实测差了两三颗气泡的高度）。
+     */
+    var wasAtBottom = atBottom()
     stack.appendChild(bubble)
     while (stack.children.length > MAX_BUBBLES) {
       var oldest = stack.firstElementChild || stack.children[0]
       if (oldest === null || oldest === undefined) break
       stack.removeChild(oldest)
     }
+    if (quiet !== true && wasAtBottom) scrollToBottom(true)
   }
 
   function openDetail(title, body) {
@@ -883,9 +1019,15 @@
         }
         /* 位置也由 host 保管：两个宿主共用一份，所以拖一边另一边会跟着走。 */
         if (data.place !== undefined && data.place !== null) applyPlacement(data.place)
-        var events = Array.isArray(data.events) ? data.events.slice(-BACKFILL) : []
-        for (var index = 0; index < events.length; index += 1) addBubble(events[index])
-        if (input !== null && activeSession !== '') input.placeholder = '发往 ' + activeSession.slice(0, 8) + '…'
+        /*
+         * **整个队列都铺出来**（host 那边每个会话各攒 30 条）—— 这就是"切过去还看得见上文"。
+         * 一屏放不下就滚，不再截断成 3 条。
+         */
+        var events = Array.isArray(data.events) ? data.events : []
+        for (var index = 0; index < events.length; index += 1) addBubble(events[index], true)
+        /* 整批铺完再滚一次：切过来先看到最新的那几颗。 */
+        scrollToBottom(true)
+        if (input !== null && activeSession !== '') input.placeholder = '发往 …' + activeSession.slice(-8)
       })
       .catch(function () {
         /* 回填拿不到不是故障：实时流一到，屏幕上就会自己长出东西来。 */

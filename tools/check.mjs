@@ -477,6 +477,10 @@ class FakeNode {
     this.placeholder = ''
     this.disabled = false
     this._text = ''
+    /* 滚动相关的三个属性：真实 DOM 上由布局算出来，这里当普通字段用（默认 0 = 没超出）。 */
+    this.scrollTop = 0
+    this.scrollHeight = 0
+    this.clientHeight = 0
   }
 
   get firstElementChild() {
@@ -770,13 +774,14 @@ async function checkFrontend() {
   assert.ok(detail.classList.contains('dshd-open'), '点击气泡没有打开详情')
   ok('点气泡打开详情')
 
-  for (let index = 0; index < 12; index += 1) {
+  for (let index = 0; index < 40; index += 1) {
     /* 说话类气泡渲染的是 `detail`，所以这里两个字段给同一句话。 */
     source.emit({ kind: 'assistant', text: `第 ${String(index)} 条`, detail: `第 ${String(index)} 条`, session: 'session-a' })
   }
-  assert.equal(stack.children.length, 6, `气泡数应当被压到 6，现在是 ${String(stack.children.length)}`)
-  assert.ok(stack.children[stack.children.length - 1].textContent.includes('第 11 条'), '被留下的不是最新的那几条')
-  ok('气泡上限 6 条，挤掉的是最旧的')
+  assert.equal(stack.children.length, 30, `气泡数应当被压到 30，现在是 ${String(stack.children.length)}`)
+  assert.ok(stack.children[stack.children.length - 1].textContent.includes('第 39 条'), '留下的不是最新的那些')
+  assert.ok(stack.children[0].textContent.includes('第 10 条'), '最旧的应当刚好被挤掉')
+  ok('气泡上限 30 颗（与 host 每个会话的队列一致），挤掉的是最旧的')
 
   source.emit({ kind: 'session:switch', text: '跟着你切到 搬弹幕', session: 'session-b' })
   assert.equal(stack.children.length, 1, '切会话没有清空旧气泡')
