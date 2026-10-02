@@ -44,6 +44,12 @@ const RECENT_PER_SESSION = 30
 const SESSION_MEMORY = 64
 /** 「上一轮说了什么」最多记住几个会话。 */
 const ANSWER_MEMORY = 32
+/** 从持久化里"补课"时，一个会话读多少条尾部事件（内存队列只留 30 条，多读一点才有筛选余地）。 */
+const HISTORY_TAIL = 80
+/** 会话标题藏在日志开头（`session/title` 事件），往前扫这么多条足够找到它。 */
+const HISTORY_TITLE_SCAN = 40
+/** 启动后隔多久开始给历史会话"补课"：错开一点，不和启动时的 I/O 抢路。 */
+const HISTORY_WARM_DELAY = 2500
 
 // --------------------------------------------------------------------------- //
 // 前端脚本：读盘 + 注入页面
@@ -447,6 +453,12 @@ export default {
       const recentBySession = new Map()
       /** 会话 id -> { id, title, lastAt, lastText, events }：会话选择菜单的数据源。 */
       const knownSessions = new Map()
+      /**
+       * 已经从持久化"补过课"的会话。
+       *
+       * 记的是"试过了"而不是"成功了"：一个读不动的会话不该每点一次就重试一遍。
+       */
+      const historyLoaded = new Set()
       /** 会话 id -> Session 对象。`sessionTitle.get()` 要的是对象，不是 id。 */
       const sessionObjects = new Map()
       /** 用户选定的会话。空串 = 还没选过（第一条带会话的事件会落位一次）。 */
@@ -659,6 +671,140 @@ export default {
         }
         list.push(event)
         if (list.length > RECENT_PER_SESSION) list.splice(0, list.length - RECENT_PER_SESSION)
+      }
+
+      /** 会话标题藏在事件流里（`session/title`），而且出现在开头附近。取最后一个：标题会被改写。 */
+      function titleFromEvents(events) {
+        let title = ''
+        for (const event of events) {
+          if (event?.type !== 'session/title') continue
+          const value = event.data?.title
+          if (typeof value === 'string' && value !== '') title = value
+        }
+        return title
+      }
+
+      /**
+       * 把一段**历史**事件读成弹幕事件（只读，不碰任何实时状态）。
+       *
+       * 实时那条路走的是两个订阅（`tools/result` 与 `session/event`），这里刻意**重写一遍判断**
+       * 而不是复用它们的 handler：那些 handler 都带副作用（落位、记账、`takeAnswer`），
+       * 对一段早就结束的历史重放它们，会把"现在在看谁"搅乱。
+       *
+       * 工具气泡靠 `tool/call` 与 `tool/result` 的 callId 配对 —— 历史里没有 `exec` 对象，
+       * 工具名和参数只能从 call 事件上取。产物统一过一遍 `interpret`，和实时那条路同一种形状。
+       */
+      function bubblesFromHistory(sessionId, sessionTitle, events) {
+        const out = []
+        const calls = new Map()
+        const emit = (raw, at) => {
+          const loose = interpret(raw)
+          if (loose === null) return
+          out.push({ kind: loose.kind, text: loose.text, detail: loose.detail, session: sessionId, sessionTitle, at })
+        }
+
+        for (const event of events) {
+          const data = event?.data
+          if (data === null || data === undefined) continue
+          const at = typeof event.time === 'number' ? event.time : Date.now()
+
+          if (event.type === 'tool/call') {
+            calls.set(String(data.callId ?? ''), {
+              name: typeof data.name === 'string' ? data.name : '',
+              arguments: data.arguments,
+            })
+            continue
+          }
+
+          if (event.type === 'tool/result') {
+            const call = calls.get(String(data.message?.toolCallId ?? ''))
+            const failed = data.error !== undefined || data.message?.isError === true
+            emit(
+              {
+                kind: failed ? 'tool:error' : 'tool:ok',
+                tool: call === undefined ? '' : call.name,
+                args: call === undefined ? null : call.arguments,
+              },
+              at,
+            )
+            continue
+          }
+
+          if (event.type === 'user/message') {
+            const text = textOfMessage(data)
+            if (text !== '') emit({ kind: 'user', text }, at)
+            continue
+          }
+
+          if (event.type === 'assistant/message') {
+            const message = data.message
+            const text = textOfMessage(message)
+            if (text === '') continue
+            const wantsTools = Array.isArray(message?.content)
+              ? message.content.some((block) => block?.type === 'tool-call')
+              : false
+            emit({ kind: wantsTools ? 'assistant' : 'assistant:final', text }, at)
+          }
+        }
+
+        return out
+      }
+
+      /** 把从日志里读到的标题/时间写回会话表，但**不**把 `lastAt` 顶成"现在"（那会把排序弄乱）。 */
+      function noteHistory(sessionId, title, lastAt, lastText) {
+        const existing = knownSessions.get(sessionId)
+        const row =
+          existing === undefined ? { id: sessionId, title: '', lastAt: 0, lastText: '', events: 0 } : existing
+        if (title !== '') row.title = title
+        if (typeof lastAt === 'number' && lastAt > 0) row.lastAt = lastAt
+        if (lastText !== '') row.lastText = lastText
+        knownSessions.set(sessionId, row)
+      }
+
+      /**
+       * 从**持久化**里把一个会话最近的弹幕读回来。
+       *
+       * 为什么需要它：队列（`recentBySession`）是**内存**的，host 一重启就全空 —— 于是菜单里
+       * 列着十几个会话，切过去每一个都只剩"钉住 xxx"那一句。可会话日志本来就一直在磁盘上，
+       * 读它就是了。
+       *
+       * 标题顺手一起读：它藏在日志开头（`session/title`），而注册表只给得出 id。
+       */
+      async function loadHistory(sessionId) {
+        if (sessionId === '' || historyLoaded.has(sessionId)) return
+        historyLoaded.add(sessionId)
+
+        let handle = null
+        try {
+          const persistence = ctx.get('sessionPersistence')
+          if (persistence === undefined || persistence === null || typeof persistence.open !== 'function') return
+
+          const snapshot = typeof persistence.stat === 'function' ? await persistence.stat(sessionId) : undefined
+          const total = typeof snapshot?.eventCount === 'number' ? snapshot.eventCount : undefined
+
+          handle = await persistence.open(sessionId, 'read')
+          const head = await handle.read(0, HISTORY_TITLE_SCAN)
+          const title = titleFromEvents(head.events)
+
+          const from = total === undefined ? 0 : Math.max(0, total - HISTORY_TAIL)
+          const tail = from === 0 ? head : await handle.read(from, HISTORY_TAIL)
+
+          const bubbles = bubblesFromHistory(sessionId, title, tail.events)
+          for (const bubble of bubbles) rememberRecent(bubble)
+
+          const last = bubbles.length > 0 ? bubbles[bubbles.length - 1] : null
+          noteHistory(sessionId, title, last === null ? 0 : last.at, last === null ? '' : last.text)
+        } catch {
+          /* 读不动就当这个会话没有历史：菜单还能用，切过去是空的，但绝不抛。 */
+        } finally {
+          if (handle !== null) {
+            try {
+              await handle.close()
+            } catch {
+              /* 关不掉就算了，不值得为一个句柄把整条路弄脏。 */
+            }
+          }
+        }
       }
 
       /** 回填：钉住了就只给那一个会话，否则把所有会话按时间混起来取最后一段。 */
@@ -1003,7 +1149,7 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v6',
+                build: 'v7',
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,
@@ -1063,10 +1209,19 @@ export default {
             kind: 'exact',
             path: `${MOUNT}/sessions`,
             handler: (req, res) => {
+              const rows = sessionList()
+              /*
+               * 顺手把还没补过课的会话读一遍（**不 await**）：菜单第一次打开时它们可能还是 id，
+               * 但读回来之后就有标题和最后一句了 —— 总比让它们永远空着强。
+               * `loadHistory` 自己按 id 去重，重复触发是空转。
+               */
+              for (const row of rows) {
+                if (row.events === 0) void loadHistory(row.id)
+              }
               sendJson(res, 200, {
                 active: activeSession,
                 focused: focusedSession,
-                sessions: sessionList(),
+                sessions: rows,
               })
             },
           }),
@@ -1104,6 +1259,12 @@ export default {
                 sendJson(res, 404, { ok: false, error: '没有这个会话', focused: focusedSession })
                 return
               }
+
+              /*
+               * 从持久化补课：切到一个本进程从没见过事件的会话时（重启后菜单里那些），
+               * 先把它的历史读回来再回话 —— 前端一拿到 200 就立刻回填，顺序不能反。
+               */
+              if (wanted !== '') await loadHistory(wanted)
 
               focusedSession = wanted
               if (wanted !== '') {
@@ -1176,6 +1337,22 @@ export default {
           }),
         'dsh-danmaku:route:place',
       )
+
+      /*
+       * 启动后错开一会儿，把工作区里那些"本进程还没见过"的会话各补一次课。
+       *
+       * 菜单在重启后列的是工作区注册表里的会话，而注册表只给得出 id —— 不预热的话，菜单里
+       * 就是一排 `…266cb42a`，切过去也是空的。错开这几秒是为了不和启动时的 I/O 抢路。
+       */
+      try {
+        ctx.timeout(() => {
+          for (const id of collectSessionIds()) {
+            if (!knownSessions.has(id)) void loadHistory(id)
+          }
+        }, HISTORY_WARM_DELAY)
+      } catch {
+        /* timer 不在就退回按需补课：`/sessions` 和 `/focus` 里都会触发。 */
+      }
 
       ctx.effect(
         () =>

@@ -106,6 +106,20 @@ async function checkHost() {
    * 假 ctx 不模拟这道门禁的话，这类错误只有在真机上才会现形，而真机上 host 代码每改一次都要
    * 重启客户端才能重载。
    */
+  /*
+   * `session-d` 的"磁盘日志"：标题 + 一次工具调用 + 一句话 + 一句回答。
+   *
+   * 形状照抄真实会话日志：标题是开头的 `session/title` 事件，工具气泡要靠 `tool/call` 与
+   * `tool/result` 的 callId 配对才能重建。
+   */
+  const HISTORY_D = [
+    { type: 'session/title', seq: 1, time: 1000, data: { title: '历史会话的标题' } },
+    { type: 'tool/call', seq: 2, time: 2000, data: { callId: 'c1', name: 'read', arguments: { file_path: 'D:/x/历史.js' } } },
+    { type: 'tool/result', seq: 3, time: 2100, data: { message: { toolCallId: 'c1' } } },
+    { type: 'user/message', seq: 4, time: 2200, data: { content: [{ type: 'text', text: '这是历史里的一句话' }] } },
+    { type: 'assistant/message', seq: 5, time: 2300, data: { message: { content: [{ type: 'text', text: '这是历史里的回答' }] } } },
+  ]
+
   const services = {
     /*
      * 三个 root 会话：a 先落位、b 是用户切过去的、c 用来验证"别的会话在说话"不会抢走 active。
@@ -119,6 +133,24 @@ async function checkHost() {
     workspaceRegistry: {
       list: () => [{ id: 'ws-1', sessionIds: ['session-d', 'session-e'] }],
     },
+    /*
+     * 会话持久化：重启后菜单里那些"本进程从没见过"的会话，标题和内容都只在这里。
+     * 只给 session-d 备一段日志；session-e 故意让 `open` 失败，用来验证"读不到也不抛"。
+     */
+    sessionPersistence: {
+      async stat(id) {
+        return id === 'session-d' ? { header: { id }, revision: 'r1', eventCount: HISTORY_D.length } : undefined
+      },
+      async open(id) {
+        if (id !== 'session-d') throw new Error('no such session')
+        return {
+          async read(offset = 0, length = 100) {
+            return { eventState: 'detached', events: HISTORY_D.slice(offset, offset + length) }
+          },
+          async close() {},
+        }
+      },
+    },
     sessionController: {
       async prompt() {
         return { accepted: true }
@@ -130,6 +162,9 @@ async function checkHost() {
     },
     timer: {
       interval() {
+        return () => {}
+      },
+      timeout() {
         return () => {}
       },
     },
@@ -388,6 +423,41 @@ async function checkHost() {
     assert.equal(probe.state.status, 200, `菜单里的 ${id} 选不动`)
   }
   ok('菜单里列出的每一个会话都选得动（含注册表里的历史会话）')
+
+  /*
+   * 注册表来的会话，标题和内容都只在持久化里 —— 切过去必须能读回来。
+   *
+   * 主人报的就是这个：菜单里列着十几个会话，切进任何一个都只剩"钉住 xxx"那一句，
+   * 因为队列是内存的、host 一重启就空。这里验证"从磁盘补课"这条新路径。
+   */
+  const historyFocus = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: 'session-d' }), historyFocus)
+  assert.equal(JSON.parse(historyFocus.state.body).ok, true, '切到历史会话失败')
+
+  const historyBackfill = fakeResponse()
+  routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), historyBackfill)
+  const historyEvents = JSON.parse(historyBackfill.state.body).events
+  assert.ok(
+    historyEvents.some((event) => event.text.includes('这是历史里的一句话')),
+    '历史会话切过去之后回填是空的 —— 队列只有内存那一份，重启就没了',
+  )
+  assert.ok(
+    historyEvents.some((event) => event.kind === 'tool:ok'),
+    '历史里的工具调用没有重建出来（tool/call 与 tool/result 没配上对）',
+  )
+  ok('切到没见过的历史会话 → 从持久化读回它的气泡')
+
+  const titled = fakeResponse()
+  sessionsRoute.handler(fakeRequest(), titled)
+  const titledRow = JSON.parse(titled.state.body).sessions.find((row) => row.id === 'session-d')
+  assert.equal(titledRow.title, '历史会话的标题', '历史会话的标题没有从日志里读出来')
+  ok('历史会话的标题从日志里读出来（不再是 id 尾部）')
+
+  /* 读不到日志的会话不该把切换弄挂：菜单还能用，切过去是空的。 */
+  const missing = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: 'session-e' }), missing)
+  assert.equal(missing.state.status, 200, '读不到日志的会话把切换弄挂了')
+  ok('读不到日志的会话也不抛（切过去是空的，但菜单还能用）')
 
   const resumed = fakeResponse()
   await focusRoute.handler(fakePostRequest({ sessionId: '' }), resumed)
