@@ -112,6 +112,13 @@ async function checkHost() {
      * 子代理会话不在这里面（`isRootSession` 会把它们挡住，另有一条断言）。
      */
     agents: { roots: () => [{ id: 'session-a' }, { id: 'session-b' }, { id: 'session-c' }] },
+    /*
+     * 工作区注册表：重启之后**唯一还认得历史会话**的地方（前两个来源都是"当前进程里活着的东西"）。
+     * 这里放两个只有它知道的会话 —— 菜单必须列得出来，而且必须选得动。
+     */
+    workspaceRegistry: {
+      list: () => [{ id: 'ws-1', sessionIds: ['session-d', 'session-e'] }],
+    },
     sessionController: {
       async prompt() {
         return { accepted: true }
@@ -361,6 +368,26 @@ async function checkHost() {
   assert.equal(bogus.state.status, 404, '没见过的会话没有被拒绝')
   assert.equal(JSON.parse(bogus.state.body).focused, 'session-c', '被拒之后状态不该变')
   ok('POST /focus 拒绝没见过的会话，且不改状态')
+
+  /*
+   * 回归：**菜单里列出来的每一条都必须选得动**。
+   *
+   * 主人撞上的就是这个：菜单列的是 root 全集（含工作区注册表里的历史会话），门禁却只认
+   * `knownSessions` —— 菜单里点哪一条都是 404「没有这个会话」。两边的判据必须同源，
+   * 所以这里直接拿菜单的输出去喂门禁，而不是各自写一份期望值。
+   */
+  const sessionsRoute = routes.get('/dsh-danmaku/v3/sessions')
+  const listed = fakeResponse()
+  sessionsRoute.handler(fakeRequest(), listed)
+  const listedIds = JSON.parse(listed.state.body).sessions.map((row) => row.id)
+  assert.ok(listedIds.includes('session-d'), '工作区注册表里的会话没有进菜单')
+  assert.ok(listedIds.includes('session-e'), '工作区注册表里的会话没有进菜单')
+  for (const id of listedIds) {
+    const probe = fakeResponse()
+    await focusRoute.handler(fakePostRequest({ sessionId: id }), probe)
+    assert.equal(probe.state.status, 200, `菜单里的 ${id} 选不动`)
+  }
+  ok('菜单里列出的每一个会话都选得动（含注册表里的历史会话）')
 
   const resumed = fakeResponse()
   await focusRoute.handler(fakePostRequest({ sessionId: '' }), resumed)

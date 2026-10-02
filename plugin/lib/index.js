@@ -543,7 +543,58 @@ export default {
       }
 
       /**
-       * 菜单里的候选会话：**所有 root 会话**，最近说过话的排前面。
+       * 菜单里能出现的会话 id：**三个来源的并集**。
+       *
+       * 1. `knownSessions` —— 本进程见过它说话的；
+       * 2. `agents.roots()` —— 活着的 root agent（有些还没开口，所以不在 1 里）；
+       * 3. `workspaceRegistry` —— 工作区注册表里登记过的会话。**重启之后只有这一份还认得人**：
+       *    前两个都是"当前进程里活着的东西"，重启即空，于是菜单里只剩主人刚打开的那一个。
+       *    它的 `list()` 是同步的、启动时已经把历史索引建好，不用读磁盘。
+       *
+       * 菜单和 `/focus` 门禁**必须共用这一个函数**。它们曾经各写一份：菜单列的是 2 的全集，
+       * 门禁只认 1 —— 于是菜单里每一条点下去都是 404「没有这个会话」，而这恰恰是主人报的那个。
+       */
+      function collectSessionIds() {
+        const ids = new Set(knownSessions.keys())
+
+        try {
+          const agents = ctx.get('agents')
+          if (agents !== undefined && agents !== null && typeof agents.roots === 'function') {
+            const roots = agents.roots()
+            if (Array.isArray(roots)) {
+              for (const agent of roots) {
+                const id = agent?.id
+                if (typeof id === 'string' && id !== '') ids.add(id)
+              }
+            }
+          }
+        } catch {
+          /* 少列几条不是故障：菜单还能用，只是安静的那些会话暂时看不见。 */
+        }
+
+        try {
+          const registry = ctx.get('workspaceRegistry')
+          if (registry !== undefined && registry !== null && typeof registry.list === 'function') {
+            const spaces = registry.list()
+            if (Array.isArray(spaces)) {
+              for (const space of spaces) {
+                const sessionIds = space?.sessionIds
+                if (!Array.isArray(sessionIds)) continue
+                for (const id of sessionIds) {
+                  if (typeof id === 'string' && id !== '') ids.add(id)
+                }
+              }
+            }
+          }
+        } catch {
+          /* 同上：注册表不在（老版本 harness）就退回前两个来源。 */
+        }
+
+        return ids
+      }
+
+      /**
+       * 菜单里的候选会话：最近说过话的排前面。
        *
        * 只列"见过事件的会话"是不够的 —— 要的是"任意选一个会话看"，包括本进程还没见它说过话的
        * 那些（重启之后，之前活跃过的会话就属于这一类）。它们没有时间也没有最后一句，于是排在后面、
@@ -561,30 +612,42 @@ export default {
           })
         }
 
+        /*
+         * 活着的 root agent 身上挂着 Session，标题就问得出来（`sessionTitle.get()` 要的是对象，
+         * 不是 id）—— 先把对象记下来，下面统一取标题。注册表里那些历史会话没有对象，
+         * 标题只能退回 id 尾部八位，总比它压根不出现强。
+         */
         try {
           const agents = ctx.get('agents')
-          const roots =
-            agents !== undefined && agents !== null && typeof agents.roots === 'function' ? agents.roots() : []
-          if (Array.isArray(roots)) {
-            for (const agent of roots) {
-              const id = agent?.id
-              if (typeof id !== 'string' || id === '' || rows.has(id)) continue
-              /*
-               * Agent 身上如果挂着 Session，标题就问得出来（`sessionTitle.get()` 要的是对象，
-               * 不是 id）。拿不到也没关系：菜单退回 id 尾部八位，总比这个会话压根不出现强。
-               */
-              const session = agent?.session
-              if (session !== undefined && session !== null) rememberSessionObject(id, session)
-              rows.set(id, { id, title: titleOf(id, ''), lastAt: 0, lastText: '', events: 0 })
+          if (agents !== undefined && agents !== null && typeof agents.roots === 'function') {
+            const roots = agents.roots()
+            if (Array.isArray(roots)) {
+              for (const agent of roots) {
+                const id = agent?.id
+                const session = agent?.session
+                if (typeof id !== 'string' || id === '') continue
+                if (session !== undefined && session !== null) rememberSessionObject(id, session)
+              }
             }
           }
         } catch {
-          /* 少列几条不是故障：菜单还能用，只是安静的那些会话暂时看不见。 */
+          /* 拿不到 Session 只是没有标题，不该影响菜单能不能列出来。 */
+        }
+
+        for (const id of collectSessionIds()) {
+          if (rows.has(id)) continue
+          rows.set(id, { id, title: titleOf(id, ''), lastAt: 0, lastText: '', events: 0 })
         }
 
         const list = [...rows.values()]
         list.sort((left, right) => right.lastAt - left.lastAt)
         return list
+      }
+
+      /** 菜单里列得出来的就必须选得动 —— 门禁直接问菜单的数据源，不再各记一份。 */
+      function isSelectableSession(sessionId) {
+        if (sessionId === '') return true
+        return collectSessionIds().has(sessionId)
       }
 
       function rememberRecent(event) {
@@ -940,7 +1003,7 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v5',
+                build: 'v6',
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,
@@ -1030,10 +1093,13 @@ export default {
               const body = await readBody(req)
               const wanted = typeof body?.sessionId === 'string' ? body.sessionId : ''
 
-              if (wanted !== '' && !knownSessions.has(wanted)) {
+              if (!isSelectableSession(wanted)) {
                 /*
-                 * 只接受见过的会话。否则一个过期的 id 会把浮层钉在一个永远不会有事件的会话上，
-                 * 表现为"弹幕忽然全没了"，而且没有任何提示 —— 比拒绝难查得多。
+                 * 只接受菜单里列得出来的会话。否则一个过期的 id 会把浮层钉在一个永远不会有事件的
+                 * 会话上，表现为"弹幕忽然全没了"，而且没有任何提示 —— 比拒绝难查得多。
+                 *
+                 * 判据必须和菜单**同源**（都走 `collectSessionIds`）：这里曾经只认 `knownSessions`，
+                 * 而菜单列的是 root 全集 —— 于是菜单里点哪一条都是 404「没有这个会话」。
                  */
                 sendJson(res, 404, { ok: false, error: '没有这个会话', focused: focusedSession })
                 return
@@ -1042,7 +1108,7 @@ export default {
               focusedSession = wanted
               if (wanted !== '') {
                 activeSession = wanted
-                activeTitle = knownSessions.get(wanted)?.title || ''
+                activeTitle = knownSessions.get(wanted)?.title || titleOf(wanted, '')
               }
 
               /*
@@ -1051,7 +1117,7 @@ export default {
                * 两个宿主各自持有一条 SSE，只在发起的那一个里改状态的话，另一个会继续显示上一个
                * 会话的气泡 —— 桌面窗口和 DSH 页面里的弹幕对不上，而且没人会想到是这个原因。
                */
-              const label = wanted === '' ? '' : knownSessions.get(wanted)?.title || ''
+              const label = wanted === '' ? '' : knownSessions.get(wanted)?.title || titleOf(wanted, '')
               push({
                 kind: 'session:switch',
                 text: wanted === '' ? '恢复自动跟随' : `钉住 ${sessionLabel(wanted, label)}`,
