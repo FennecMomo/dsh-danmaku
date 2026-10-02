@@ -87,7 +87,16 @@
     /* 隐藏态：变淡，并且**不再可点**。"别挡着我"这个状态里，一个还吞点击的淡方块是个陷阱。 */
     '#' + ROOT_ID + '.dshd-hidden .dshd-bubble{opacity:.24;pointer-events:none}',
     /* 气泡：唯一大面积可点区域，所以它是 pointer-events:auto 的那个。 */
-    '.dshd-bubble{pointer-events:auto;position:relative;max-width:100%;box-sizing:border-box;padding:8px 12px;',
+    /*
+     * `flex:0 0 auto` 是**必须的**，不是保险。
+     *
+     * 气泡栈是 `display:flex; flex-direction:column` + `max-height` + `overflow-y:auto`，
+     * 而气泡自己带着 `overflow:hidden`。这两件事凑在一起就出事：flex 子项默认 `flex-shrink:1`，
+     * 而 `overflow` 一旦不是 `visible`，它在主轴上的 `min-height:auto` 就解析成 0 —— 于是内容
+     * 装不下时浏览器选择**把每颗气泡压扁**，而不是让容器滚起来。主人报的"信息一多气泡就像被
+     * 压扁了"正是这个。钉住之后气泡永远保持自然高度，超出交给容器滚。
+     */
+    '.dshd-bubble{pointer-events:auto;position:relative;flex:0 0 auto;max-width:100%;box-sizing:border-box;padding:8px 12px;',
     'border-radius:10px;border:1px solid var(--dshd-accent);background:var(--dshd-fill);color:#F5F7FA;',
     /* 限高：气泡是"扫一眼"，渲染后的长消息超出部分藏在"点开看全文"里，不让它长成一篇文章。 */
     'max-height:230px;overflow:hidden;word-break:break-word;box-shadow:0 4px 14px rgba(0,0,0,.3);cursor:pointer}',
@@ -176,7 +185,8 @@
     'background:#0E1218;border:1px solid #3A4552;border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.45)}',
     '.dshd-menu.dshd-open{display:flex}',
     '.dshd-menu-head{padding:5px 8px 6px;margin-bottom:4px;border-bottom:1px solid #232B36;color:#5C6672;font-size:11px}',
-    '.dshd-item{display:flex;flex-direction:column;gap:1px;width:100%;box-sizing:border-box;text-align:left;',
+    /* 同一类坑：菜单也是"限高的 flex 滚动容器"，谁给菜单项加上 overflow 就会重演压扁。 */
+    '.dshd-item{flex:0 0 auto;display:flex;flex-direction:column;gap:1px;width:100%;box-sizing:border-box;text-align:left;',
     'background:transparent;border:none;border-radius:6px;padding:6px 8px;color:#DCE3EA;font:inherit;font-size:12px;cursor:pointer}',
     '.dshd-item:hover{background:#1A2230}',
     '.dshd-item.dshd-current{background:#1B2B47}',

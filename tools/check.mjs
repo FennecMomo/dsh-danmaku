@@ -728,6 +728,20 @@ async function checkFrontend() {
   assert.ok(document.getElementById('dsh-danmaku-style') !== null, '没有注入样式')
   ok('建出根节点与样式')
 
+  /*
+   * 回归：气泡必须钉住 `flex-shrink`。
+   *
+   * 气泡栈是"限高的 flex 滚动容器"，气泡自己又是 `overflow:hidden` —— 这两件事凑在一起时，
+   * flex 子项在主轴上的 `min-height:auto` 会解析成 0，于是内容一多浏览器就把每颗气泡**压扁**
+   * 而不是让容器滚（主人报的"信息一多气泡像被压扁了"）。这条断言守住那一行 CSS。
+   */
+  const injectedCss = document.getElementById('dsh-danmaku-style').textContent
+  assert.ok(
+    /\.dshd-bubble\{[^}]*flex:0 0 auto/.test(injectedCss),
+    '气泡没有钉住 flex-shrink —— 在限高的 flex 滚动容器里会被压扁',
+  )
+  ok('气泡钉住 flex-shrink（信息再多也只是滚，不会被压扁）')
+
   /* 只有气泡和按钮可以在指针上"存在"，其余一切必须穿透——否则 overlay 里会整块桌面点不动。 */
   const stack = findByClass(root, 'dshd-stack')
   assert.ok(stack !== null, '没有气泡栈')
