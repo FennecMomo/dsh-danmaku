@@ -41,7 +41,7 @@ const FRONT_URL = '/dsh-danmaku/v3/bubbles.js'
  * 期望的 host 版本，与 `lib/index.js` 里 status 的 `build` 字段一致。
  * 改了 host 就把它跟着 +1 —— "重启之后自检该不该全绿"因此只看一处。
  */
-const EXPECTED_BUILD = 'v4'
+const EXPECTED_BUILD = 'v5'
 
 let failed = 0
 let skipped = 0

@@ -723,7 +723,25 @@ export default {
             at: Date.now(),
           })
         } else if (sessionId !== focusedSession) {
-          /* 选了别的会话：它的事件不播（但仍然记进了会话表，菜单里看得到它在说什么）。 */
+          /*
+           * 选了别的会话：它的事件**不播**，但要**进回填**。
+           *
+           * 只记会话表是不够的 —— 那样从菜单切过去时回填里一条都没有（屏幕上只剩"钉住 xxx"
+           * 那一句），看起来像这个会话什么都没发生过。这个 bug 是测试时撞见的：菜单里明明写着
+           * 它有几十条事件，切过去却是空的。
+           */
+          if (spoken !== null) {
+            rememberRecent({
+              kind: spoken.kind,
+              text: spoken.text,
+              detail: spoken.detail,
+              session: sessionId,
+              sessionTitle: title,
+              tool: typeof event.tool === 'string' ? event.tool : '',
+              reason: typeof event.reason === 'string' ? event.reason : '',
+              at: Date.now(),
+            })
+          }
           return
         } else {
           activeSession = sessionId
@@ -922,7 +940,7 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v4',
+                build: 'v5',
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,

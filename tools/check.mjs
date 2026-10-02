@@ -383,6 +383,26 @@ async function checkHost() {
   assert.equal(badPlace.state.status, 400, '负数位置没有被拒绝')
   ok('POST /place 拒绝负数位置')
 
+  // -- 被挡住的会话，切过去要有回填 ------------------------------------------ //
+
+  /*
+   * 只"记进会话表"是不够的：菜单里写着它有几十条事件，切过去却只剩一条"钉住 xxx" ——
+   * 这正是测试时在真机上撞见的。所以被过滤掉的事件也要进回填缓冲区。
+   */
+  const switchBack = fakeResponse()
+  await focusRoute.handler(fakePostRequest({ sessionId: 'session-b' }), switchBack)
+  assert.equal(JSON.parse(switchBack.state.body).focused, 'session-b', '没切过去')
+  const backfilled = fakeResponse()
+  routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), backfilled)
+  const backfillBody = JSON.parse(backfilled.state.body)
+  assert.ok(
+    backfillBody.events.some(
+      (event) => event.session === 'session-b' && event.text.includes('把弹幕改成普通前端'),
+    ),
+    '切到那个一直被挡着的会话之后，回填里没有它的事件',
+  )
+  ok('被挡住的会话仍然进回填（切过去不会是空白）')
+
   return { routes, handlers, ctx }
 }
 
@@ -471,6 +491,23 @@ class FakeNode {
 
   set textContent(value) {
     this._text = String(value)
+    this.children.length = 0
+  }
+
+  /*
+   * 真实 DOM 会解析标签；这里不解析，只把 HTML 存下来给断言看，并把去掉标签后的近似纯文本
+   * 塞进 `_text` —— 这样那些用 `textContent` 写的断言在改成渲染之后依然读得通。
+   */
+  get innerHTML() {
+    return this._html ?? ''
+  }
+
+  set innerHTML(value) {
+    this._html = String(value)
+    this._text = this._html
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
     this.children.length = 0
   }
 
@@ -692,13 +729,50 @@ async function checkFrontend() {
   assert.notEqual(toolFill, talkFill, '动作和说话的底色一样 —— 那就不叫"一眼分得开"')
   ok('动作与说话用不同底色')
 
+  /*
+   * Markdown **渲染**：说话类气泡渲染的是 `detail`（原文），不是 host 洗过的 `text`。
+   * 断言看的是渲染结果（innerHTML）—— 露着 `**` 才是要拦的东西。
+   */
+  source.emit({
+    kind: 'assistant',
+    text: '（这是菜单预览用的纯文本）',
+    detail: '**加粗** 与 `代码`\n\n- 甲\n- 乙\n\n# 标题\n\n[官网](https://example.com)',
+    session: 'session-a',
+  })
+  const rendered = stack.children[stack.children.length - 1].children[0].innerHTML
+  assert.ok(rendered.includes('<strong>加粗</strong>'), '没有把 **加粗** 渲染成 <strong>')
+  assert.ok(rendered.includes('<code>代码</code>'), '行内代码没有渲染')
+  assert.ok(rendered.includes('<li>甲</li>') && rendered.includes('<li>乙</li>'), '列表没有渲染')
+  assert.ok(rendered.includes('dshd-md-h'), '标题没有渲染成小标题')
+  assert.ok(rendered.includes('<a href="https://example.com"'), '链接没有渲染')
+  ok('Markdown 渲染：加粗 / 行内代码 / 列表 / 标题 / 链接')
+
+  /*
+   * 安全：消息里的 HTML 只能变成看得见的文字，不能被执行；`javascript:` 链接只留文字。
+   * 这条比渲染本身更要紧 —— 渲染意味着从今往后真的在用 innerHTML。
+   */
+  source.emit({
+    kind: 'assistant',
+    text: 'x',
+    detail: '<img src=x onerror=alert(1)> <script>alert(2)</script> [点我](javascript:alert(3))',
+    session: 'session-a',
+  })
+  const dangerous = stack.children[stack.children.length - 1].children[0].innerHTML
+  assert.ok(!dangerous.includes('<img'), 'HTML 注入没有被转义')
+  assert.ok(!dangerous.includes('<script'), 'script 标签没有被转义')
+  assert.ok(dangerous.includes('&lt;script&gt;'), '转义之后的文字应当还看得见')
+  assert.ok(!dangerous.includes('javascript:'), 'javascript: 链接没有被拦下')
+  assert.ok(dangerous.includes('点我'), '拦下链接之后应当只留文字')
+  ok('Markdown 渲染：HTML 与 javascript: 都被挡住')
+
   stack.children[0].dispatch('click')
   const detail = findByClass(root, 'dshd-detail')
   assert.ok(detail.classList.contains('dshd-open'), '点击气泡没有打开详情')
   ok('点气泡打开详情')
 
   for (let index = 0; index < 12; index += 1) {
-    source.emit({ kind: 'assistant', text: `我说：第 ${String(index)} 条`, detail: 'x', session: 'session-a' })
+    /* 说话类气泡渲染的是 `detail`，所以这里两个字段给同一句话。 */
+    source.emit({ kind: 'assistant', text: `第 ${String(index)} 条`, detail: `第 ${String(index)} 条`, session: 'session-a' })
   }
   assert.equal(stack.children.length, 6, `气泡数应当被压到 6，现在是 ${String(stack.children.length)}`)
   assert.ok(stack.children[stack.children.length - 1].textContent.includes('第 11 条'), '被留下的不是最新的那几条')

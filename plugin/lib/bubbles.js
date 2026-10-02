@@ -85,7 +85,27 @@
     /* 气泡：唯一大面积可点区域，所以它是 pointer-events:auto 的那个。 */
     '.dshd-bubble{pointer-events:auto;position:relative;max-width:100%;box-sizing:border-box;padding:8px 12px;',
     'border-radius:10px;border:1px solid var(--dshd-accent);background:var(--dshd-fill);color:#F5F7FA;',
-    'white-space:pre-wrap;word-break:break-word;box-shadow:0 4px 14px rgba(0,0,0,.3);cursor:pointer}',
+    /* 限高：气泡是"扫一眼"，渲染后的长消息超出部分藏在"点开看全文"里，不让它长成一篇文章。 */
+    'max-height:230px;overflow:hidden;word-break:break-word;box-shadow:0 4px 14px rgba(0,0,0,.3);cursor:pointer}',
+    /*
+     * 气泡里的 Markdown：样式全部收小。
+     * 尤其标题 —— 渲染成巨大的 h1 会把气泡撑爆，所以标题是"小号加粗"，只用来分层，不用来喊。
+     */
+    '.dshd-md p{margin:0 0 5px}',
+    '.dshd-md p:last-child,.dshd-md ul:last-child,.dshd-md ol:last-child,.dshd-md pre:last-child{margin-bottom:0}',
+    '.dshd-md strong{font-weight:700;color:#FFFFFF}',
+    '.dshd-md em{font-style:italic}',
+    '.dshd-md del{opacity:.65}',
+    '.dshd-md code{font-family:"Cascadia Mono",Consolas,"Microsoft YaHei UI",monospace;font-size:12px;',
+    'background:rgba(255,255,255,.10);border-radius:4px;padding:1px 4px}',
+    '.dshd-md pre{margin:0 0 5px;padding:6px 8px;background:rgba(0,0,0,.35);border-radius:6px;overflow:hidden}',
+    '.dshd-md pre code{background:none;padding:0;font-size:11px;line-height:1.45}',
+    '.dshd-md ul,.dshd-md ol{margin:0 0 5px;padding-left:18px}',
+    '.dshd-md li{margin:0 0 2px}',
+    '.dshd-md blockquote{margin:0 0 5px;padding-left:8px;border-left:2px solid #3A4552;color:#B8C2CC}',
+    '.dshd-md hr{border:none;border-top:1px solid #2A333E;margin:6px 0}',
+    '.dshd-md a{color:#7FB6FF;text-decoration:underline}',
+    '.dshd-md .dshd-md-h{font-weight:700;color:#FFFFFF;margin:0 0 4px}',
     '.dshd-bubble.dshd-flat{cursor:default}',
     /* 右侧小尾巴：所有气泡都是右对齐的，尾巴指向"这颗是从右边冒出来的"。 */
     '.dshd-bubble::after{content:"";position:absolute;right:6px;bottom:-7px;width:0;height:0;',
@@ -152,6 +172,188 @@
     if (className) node.className = className
     if (text !== undefined && text !== null) node.textContent = text
     return node
+  }
+
+  /* -- Markdown ---------------------------------------------------------------- */
+
+  /*
+   * 气泡**渲染** Markdown，而不是把标记洗掉。
+   *
+   * 洗掉是走不通的：Markdown 的写法太多（嵌套强调、行内代码混在列表里、缩进、表格…），
+   * 漏掉任何一种都会在气泡上露出半截符号，而且"少洗一个"和"多洗一个"都很难被发现。
+   * 渲染则是把它变回它本来的样子。
+   *
+   * 为什么自己写而不是引库：这份脚本必须**自包含** —— 它同时跑在 DSH 页面和 overlay 页面里，
+   * 不能 require 任何东西，也不该为了一段消息去下载一个解析器。会话消息里真正会出现的标记
+   * 就这几种，够用就好。
+   *
+   * **安全**：先把整段文本里的 `&` `<` `>` `"` 全部转义，再插入这个文件自己生成的标签。
+   * 所以消息内容无论写什么，都只会是**文字**，不存在"内容被当成 HTML 执行"的路径；
+   * 链接另外限制协议（只认 http/https 和相对路径，`javascript:` 之类丢掉链接、只留文字）。
+   */
+
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  }
+
+  /** 只放行 http/https 与相对路径；其它协议（javascript:、data: …）返回空串，调用方只留文字。 */
+  function safeUrl(url) {
+    var trimmed = String(url).trim()
+    if (/^https?:\/\//i.test(trimmed)) return trimmed
+    if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return ''
+    return trimmed
+  }
+
+  /** 行内标记。入参**必须**是已经转义过的文本。 */
+  function inlineMarkdown(escaped) {
+    var out = escaped
+    /* 行内代码先做：它里面的 `*` `_` 不该再被当成强调。 */
+    out = out.replace(/`([^`]+)`/g, '<code>$1</code>')
+    out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    out = out.replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    out = out.replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    out = out.replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (whole, label, url) {
+      var href = safeUrl(url)
+      if (href === '') return label
+      return '<a href="' + href + '" target="_blank" rel="noreferrer noopener">' + label + '</a>'
+    })
+    return out
+  }
+
+  /**
+   * 极简 Markdown → HTML（块级 + 行内）。返回值可以直接塞进 `innerHTML`。
+   *
+   * 支持的：段落、`#` 标题（渲染成统一样式的小标题，不是巨大的 h1）、有序/无序列表、引用、
+   * 围栏代码块、行内代码、加粗/斜体/删除线、链接、水平线。
+   * 不支持的（表格、图片、嵌套列表）就按普通文字显示 —— 它们本来就少见，气泡也不是阅读器。
+   */
+  function markdownToHtml(input) {
+    var lines = String(input === null || input === undefined ? '' : input).replace(/\r\n?/g, '\n').split('\n')
+    var out = []
+    var paragraph = []
+    var list = null
+    var quote = []
+    var code = null
+
+    function flushParagraph() {
+      if (paragraph.length === 0) return
+      /* 段落内的换行照原样保留：中文消息里一个换行通常就是"换行"，不是"接着往下写"。 */
+      out.push(
+        '<p>' +
+          paragraph
+            .map(function (line) {
+              return inlineMarkdown(escapeHtml(line))
+            })
+            .join('<br>') +
+          '</p>',
+      )
+      paragraph = []
+    }
+    function flushList() {
+      if (list === null) return
+      out.push('</' + list + '>')
+      list = null
+    }
+    function flushQuote() {
+      if (quote.length === 0) return
+      out.push(
+        '<blockquote>' +
+          quote
+            .map(function (line) {
+              return inlineMarkdown(escapeHtml(line))
+            })
+            .join('<br>') +
+          '</blockquote>',
+      )
+      quote = []
+    }
+    function flushAll() {
+      flushParagraph()
+      flushList()
+      flushQuote()
+    }
+
+    for (var index = 0; index < lines.length; index += 1) {
+      var line = lines[index]
+      var isFence = /^\s*```/.test(line)
+
+      if (code !== null) {
+        if (isFence) {
+          out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>')
+          code = null
+        } else {
+          code.push(line)
+        }
+        continue
+      }
+      if (isFence) {
+        flushAll()
+        code = []
+        continue
+      }
+      if (/^\s*$/.test(line)) {
+        flushAll()
+        continue
+      }
+
+      var heading = /^\s{0,3}(#{1,6})\s+(.*)$/.exec(line)
+      if (heading !== null) {
+        flushAll()
+        out.push('<div class="dshd-md-h">' + inlineMarkdown(escapeHtml(heading[2])) + '</div>')
+        continue
+      }
+
+      if (/^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+        flushAll()
+        out.push('<hr>')
+        continue
+      }
+
+      var bullet = /^\s{0,3}[-*+]\s+(.*)$/.exec(line)
+      if (bullet !== null) {
+        flushParagraph()
+        flushQuote()
+        if (list !== 'ul') {
+          flushList()
+          out.push('<ul>')
+          list = 'ul'
+        }
+        out.push('<li>' + inlineMarkdown(escapeHtml(bullet[1])) + '</li>')
+        continue
+      }
+
+      var numbered = /^\s{0,3}\d+[.)]\s+(.*)$/.exec(line)
+      if (numbered !== null) {
+        flushParagraph()
+        flushQuote()
+        if (list !== 'ol') {
+          flushList()
+          out.push('<ol>')
+          list = 'ol'
+        }
+        out.push('<li>' + inlineMarkdown(escapeHtml(numbered[1])) + '</li>')
+        continue
+      }
+
+      var quoted = /^\s{0,3}>\s?(.*)$/.exec(line)
+      if (quoted !== null) {
+        flushParagraph()
+        flushList()
+        quote.push(quoted[1])
+        continue
+      }
+
+      paragraph.push(line.replace(/^\s+/, ''))
+    }
+
+    if (code !== null) out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>')
+    flushAll()
+    return out.join('')
   }
 
   /**
@@ -425,12 +627,25 @@
     var text = typeof event.text === 'string' ? event.text : ''
     if (text === '') return
     var kind = typeof event.kind === 'string' ? event.kind : ''
+    var detail = typeof event.detail === 'string' ? event.detail.trim() : ''
 
-    var bubble = element('div', 'dshd-bubble dshd-in', text)
+    /*
+     * 渲染源：说话类事件用 `detail`（那是**原文**，Markdown 完好），其余用 `text`。
+     *
+     * 说话类为什么不用 `text`：host 那边的 `text` 是"洗掉标记、截到 260 字"的版本，它现在
+     * 专门留给 `☰` 菜单当预览用（菜单要的就是一行纯文本）。渲染 Markdown 需要原文，而原文
+     * 一直在 `detail` 里 —— 所以这一版前端不必等 host 配合，刷新页面就生效。
+     */
+    var markdownKinds = { user: true, assistant: true, 'assistant:final': true, 'turn:end': true }
+    var source = markdownKinds[kind] === true && detail !== '' ? detail : text
+
+    var bubble = element('div', 'dshd-bubble dshd-in')
+    var body = element('div', 'dshd-md')
+    body.innerHTML = markdownToHtml(source)
+    bubble.appendChild(body)
     bubble.style.setProperty('--dshd-accent', ACCENT[kind] || '#4C86E8')
     bubble.style.setProperty('--dshd-fill', FILL[kind] || FILL['tool:ok'])
 
-    var detail = typeof event.detail === 'string' ? event.detail.trim() : ''
     /*
      * 没有详情就不给点击反馈。
      *
@@ -456,7 +671,8 @@
 
   function openDetail(title, body) {
     detailTitle.textContent = title
-    detailBody.textContent = body
+    /* 详情同样渲染 —— 那里才是读全文的地方，更该是渲染后的样子。 */
+    detailBody.innerHTML = markdownToHtml(body)
     detailBox.classList.add('dshd-open')
     root.classList.remove('dshd-hidden')
   }
