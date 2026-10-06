@@ -38,10 +38,18 @@ const PORT = Number(argument('--port', process.env.DSH_DANMAKU_PORT ?? '19387'))
 const ORIGIN = `http://127.0.0.1:${String(PORT)}`
 const FRONT_URL = '/dsh-danmaku/v3/bubbles.js'
 /*
- * 期望的 host 版本，与 `lib/index.js` 里 status 的 `build` 字段一致。
- * 改了 host 就把它跟着 +1 —— "重启之后自检该不该全绿"因此只看一处。
+ * 期望的 host 版本，直接从 `lib/index.js` 里 status 的 `build` 字段读出来 ——
+ * 不再手抄一份。手抄那份每发一版就会假报警一次（"期望 v5、实际 v7"），
+ * 而这条断言真正要回答的是"跑着的进程是不是磁盘上这份代码"，不是"版本号等于几"。
  */
-const EXPECTED_BUILD = 'v5'
+const EXPECTED_BUILD = (() => {
+  const source = readFileSync(join(ROOT, 'plugin', 'lib', 'index.js'), 'utf8')
+  const found = /\bbuild:\s*'(v\d+)'/.exec(source)
+  if (found === null) {
+    throw new Error('读不出 lib/index.js 里的 build 版本号，自检没法判断进程新旧')
+  }
+  return found[1]
+})()
 
 let failed = 0
 let skipped = 0
