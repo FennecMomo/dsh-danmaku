@@ -471,6 +471,13 @@ export default {
        * 内容一长就往下长，按钮行直接被顶出屏幕（主人报的第 4 条就是这个）。
        */
       let placement = { right: 18, bottom: 128 }
+      /**
+       * 弹幕现在显不显示。
+       *
+       * 和位置一样存在 host：DSH 页面和桌面 overlay 是两个前端，而侧栏底部那个开关只有一个 ——
+       * 各记一份的话，两边立刻会各说各话。默认显示：装了插件却什么都看不见，比看得见更费解。
+       */
+      let visible = true
       /** 会话 id -> 这一轮最后一段助手文本，用来判断「结束但没有回复」。 */
       const lastAnswer = new Map()
       /** 只在诊断里用：一共播出去多少条。 */
@@ -1149,11 +1156,12 @@ export default {
               })()
               sendJson(res, 200, {
                 ok: true,
-                build: 'v7',
+                build: 'v8',
                 active: activeSession,
                 activeTitle,
                 focused: focusedSession,
                 place: placement,
+                visible,
                 sessionCount: knownSessions.size,
                 sessions: sessionList(),
                 events: published,
@@ -1190,6 +1198,7 @@ export default {
                 activeTitle,
                 focused: focusedSession,
                 place: placement,
+                visible,
                 events: eventsForBackfill(),
               })
             },
@@ -1336,6 +1345,42 @@ export default {
             },
           }),
         'dsh-danmaku:route:place',
+      )
+
+      /*
+       * 显示 / 隐藏。侧栏底部那个开关和浮层自己都能改它，两边问的是同一个答案。
+       */
+      ctx.effect(
+        () =>
+          ctx.webServer.register({
+            kind: 'exact',
+            path: `${MOUNT}/visible`,
+            handler: async (req, res) => {
+              if (req.method !== 'POST') {
+                sendJson(res, 200, { ok: true, visible })
+                return
+              }
+              const body = await readBody(req)
+              if (typeof body?.visible === 'boolean' && body.visible !== visible) {
+                visible = body.visible
+                /*
+                 * 推给**所有**开着的前端，不只是发起的那一个：开关长在 DSH 页面里，
+                 * 而桌面 overlay 是另一个窗口，它得跟着一起变。
+                 */
+                push({
+                  kind: 'visibility',
+                  visible,
+                  text: visible ? '弹幕回来了' : '弹幕收起来了',
+                  detail: '',
+                  session: activeSession,
+                  sessionTitle: activeTitle,
+                  at: Date.now(),
+                })
+              }
+              sendJson(res, 200, { ok: true, visible })
+            },
+          }),
+        'dsh-danmaku:route:visible',
       )
 
       /*

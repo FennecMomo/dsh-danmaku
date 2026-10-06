@@ -1,13 +1,26 @@
 {
   "name": "dsh-danmaku",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "把会话正在发生的事变成一颗颗气泡：一份独立前端同时挂在 DSH 页面与桌面 overlay 窗口，透明/置顶/穿透全部交给 dsh-desktop-overlay",
   "type": "module",
   "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
     }
   }
 }

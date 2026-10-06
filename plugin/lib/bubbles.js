@@ -86,6 +86,14 @@
     'font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;font-size:13px;line-height:1.5}',
     /* 隐藏态：变淡，并且**不再可点**。"别挡着我"这个状态里，一个还吞点击的淡方块是个陷阱。 */
     '#' + ROOT_ID + '.dshd-hidden .dshd-bubble{opacity:.24;pointer-events:none}',
+    /*
+     * 真隐藏：侧栏底部那个开关关掉时走这一条。
+     *
+     * 和上面的"淡化"是两件事 —— 淡化到 24% 还占着屏幕、还看得见（那是"别挡着我，但我要盯着"），
+     * 这里则是**整块消失**。所以必须是 display:none 而不是 opacity:0：后者仍然吃鼠标事件，
+     * 而一块看不见却吞点击的浮层是纯粹的陷阱。
+     */
+    '#' + ROOT_ID + '.dshd-gone{display:none}',
     /* 气泡：唯一大面积可点区域，所以它是 pointer-events:auto 的那个。 */
     /*
      * `flex:0 0 auto` 是**必须的**，不是保险。
@@ -993,11 +1001,22 @@
 
   /* -- 数据 ------------------------------------------------------------------ */
 
+  /** 显隐由 host 说了算：开关长在 DSH 页面里，而桌面 overlay 是另一个窗口。 */
+  function applyVisible(next) {
+    if (root === null) return
+    root.classList.toggle('dshd-gone', next !== true)
+  }
+
   function handle(event) {
     if (event === null || event === undefined) return
     if (event.kind === 'place') {
       /* 另一个窗口把浮层拖走了：跟着挪，但**不长气泡** —— 它是位置，不是"发生了什么"。 */
       applyPlacement({ right: event.right, bottom: event.bottom })
+      return
+    }
+    if (event.kind === 'visibility') {
+      /* 侧栏那个开关改的。同样**不长气泡**：它是"显不显示"，不是"发生了什么"。 */
+      applyVisible(event.visible === true)
       return
     }
     if (typeof event.session === 'string' && event.session !== '') activeSession = event.session
@@ -1029,6 +1048,8 @@
         }
         /* 位置也由 host 保管：两个宿主共用一份，所以拖一边另一边会跟着走。 */
         if (data.place !== undefined && data.place !== null) applyPlacement(data.place)
+        /* 显隐同理：刷新之后浮层该不该出现，问 host，别自己猜。 */
+        if (data.visible !== undefined && data.visible !== null) applyVisible(data.visible === true)
         /*
          * **整个队列都铺出来**（host 那边每个会话各攒 30 条）—— 这就是"切过去还看得见上文"。
          * 一屏放不下就滚，不再截断成 3 条。

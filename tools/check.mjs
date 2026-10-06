@@ -240,11 +240,11 @@ async function checkHost() {
 
   // -- 路由 ---------------------------------------------------------------- //
 
-  for (const path of ['frontend', 'status', 'recent', 'send', 'stream', 'sessions', 'focus', 'place']) {
+  for (const path of ['frontend', 'status', 'recent', 'send', 'stream', 'sessions', 'focus', 'place', 'visible']) {
     const suffix = path === 'frontend' ? FRONT_URL : `/dsh-danmaku/v3/${path}`
     assert.ok(routes.has(suffix), `路由没注册：${suffix}`)
   }
-  ok('八条路由全部注册')
+  ok('九条路由全部注册')
 
   const frontend = fakeResponse()
   routes.get(FRONT_URL).handler(fakeRequest(), frontend)
@@ -479,6 +479,45 @@ async function checkHost() {
   await placeRoute.handler(fakePostRequest({ right: -5, bottom: 10 }), badPlace)
   assert.equal(badPlace.state.status, 400, '负数位置没有被拒绝')
   ok('POST /place 拒绝负数位置')
+
+  // -- 显示 / 隐藏 ------------------------------------------------------------ //
+
+  /*
+   * 显隐存在 host：侧栏底部那个开关只有一个，而前端有两个（DSH 页面 + 桌面 overlay）。
+   * 按钮自己记一份的话，另一个窗口立刻就对不上了。
+   */
+  const visibleRoute = routes.get('/dsh-danmaku/v3/visible')
+  const shown = fakeResponse()
+  await visibleRoute.handler(fakeRequest(), shown)
+  assert.equal(JSON.parse(shown.state.body).visible, true, '默认应当是显示')
+
+  const framesBefore = stream.state.frames.length
+  const hidden = fakeResponse()
+  await visibleRoute.handler(fakePostRequest({ visible: false }), hidden)
+  assert.equal(JSON.parse(hidden.state.body).visible, false, '隐藏没有生效')
+  assert.ok(stream.state.frames.length > framesBefore, '改显隐没有推给前端')
+  const hideFrame = JSON.parse(String(stream.state.frames[stream.state.frames.length - 1]).replace(/^data: /, '').trim())
+  assert.equal(hideFrame.kind, 'visibility', '推的不是 visibility 事件')
+  assert.equal(hideFrame.visible, false, '事件里没有带上显隐状态')
+  ok('POST /visible 改显隐，并把状态推给所有前端')
+
+  /* 状态没变时不该推事件：那个按钮每 5 秒轮询一次，重复推会把队列塞满。 */
+  const framesSame = stream.state.frames.length
+  const again = fakeResponse()
+  await visibleRoute.handler(fakePostRequest({ visible: false }), again)
+  assert.equal(stream.state.frames.length, framesSame, '状态没变也推了事件')
+  ok('显隐没变时不推事件（轮询不该塞满队列）')
+
+  /* 回填要带上显隐，否则刷新之后浮层会自己冒出来。 */
+  const visibleBackfill = fakeResponse()
+  routes.get('/dsh-danmaku/v3/recent').handler(fakeRequest(), visibleBackfill)
+  assert.equal(JSON.parse(visibleBackfill.state.body).visible, false, '回填没有带上显隐状态')
+  ok('回填带上显隐状态')
+
+  /* 恢复显示，别把后面的断言带进隐藏态。 */
+  const restoreVisible = fakeResponse()
+  await visibleRoute.handler(fakePostRequest({ visible: true }), restoreVisible)
+  assert.equal(JSON.parse(restoreVisible.state.body).visible, true, '恢复显示失败')
 
   // -- 被挡住的会话，切过去要有回填 ------------------------------------------ //
 
@@ -812,6 +851,13 @@ async function checkFrontend() {
   )
   ok('气泡钉住 flex-shrink（信息再多也只是滚，不会被压扁）')
 
+  /*
+   * 真隐藏必须是 `display:none`。用 `opacity:0` 的话浮层还在原地吃鼠标事件 ——
+   * 一块看不见却吞点击的东西，比看得见更糟。
+   */
+  assert.ok(/\.dshd-gone\{display:none\}/.test(injectedCss), '隐藏没有用 display:none（会留下吞点击的透明块）')
+  ok('真隐藏用 display:none（不留下吞点击的透明块）')
+
   /* 只有气泡和按钮可以在指针上"存在"，其余一切必须穿透——否则 overlay 里会整块桌面点不动。 */
   const stack = findByClass(root, 'dshd-stack')
   assert.ok(stack !== null, '没有气泡栈')
@@ -918,6 +964,18 @@ async function checkFrontend() {
   eye.dispatch('click')
   assert.ok(!root.classList.contains('dshd-hidden'), '◐ 再点一次没有恢复')
   ok('◐ 淡化 / 恢复')
+
+  /*
+   * 显隐事件：侧栏那个开关推过来时，浮层整块消失（而不是淡化）。
+   * 它**不该长气泡** —— 它是"显不显示"，不是"发生了什么"。
+   */
+  const bubblesBeforeHide = stack.children.length
+  source.emit({ kind: 'visibility', visible: false })
+  assert.ok(root.classList.contains('dshd-gone'), 'visibility 事件没有把浮层藏起来')
+  assert.equal(stack.children.length, bubblesBeforeHide, '显隐事件不该长气泡')
+  source.emit({ kind: 'visibility', visible: true })
+  assert.ok(!root.classList.contains('dshd-gone'), 'visibility 事件没有把浮层放回来')
+  ok('收到 visibility 事件 → 整块显隐，且不长气泡')
 
   const pen = findByTitle(root, '发一句话')
   assert.ok(pen !== null, '找不到输入条按钮')
